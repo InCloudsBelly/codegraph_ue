@@ -4,6 +4,7 @@
 
 - 查询时补充 Unreal `U/A/F/I/E` 类型前缀候选与源码文件基名锚点，保留显式文件路径和行号目标的优先级。
 - 超大索引限制昂贵的宽泛搜索，保留精确符号查询及图关系查询。
+- 默认将 `.inl`（含大小写扩展名）按 C++ 源码索引，无需项目单独配置；保留原文件路径。升级已有索引后运行一次正常 `codegraph sync` 核对覆盖，不能仅凭 `status` 的零 pending 判定已补齐；已有 `.inl` 映射的项目行为不变。
 - 通过默认数据目录中的 `.codegraph/indexing.json` 配置个人 `include` / `exclude`，把被 Git 忽略或经项目内链接接入的插件源码纳入索引、同步和监听；Git 元数据和索引目录仍受保护。
 - Windows 提供可选的 `scripts\local-install.bat`，构建后执行全局 npm link；`--undo` 安装 package.json 声明的官方基础版本，不代表恢复此前未知的全局版本。SelfWorkFlow 接入使用固定子模块构建，无需运行此全局链接脚本。
 

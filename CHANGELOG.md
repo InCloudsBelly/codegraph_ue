@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- 默认解析 `.inl` 内的 C++ 实现，插件及引擎内联代码可参与查询、调用关系和增量同步。
 - Unreal 查询补充类型前缀和源码文件基名候选，优先展示明确目标及相关关系。
 - 支持个人 include/exclude 配置，将被忽略或通过项目内链接接入的插件源码纳入索引、同步和监听。
 - 超大项目查询限制代价高的宽泛搜索，保留精确符号和图查询。

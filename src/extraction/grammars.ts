@@ -85,6 +85,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cxx': 'cpp',
   '.hpp': 'cpp',
   '.hxx': 'cpp',
+  '.inl': 'cpp',
   '.cs': 'csharp',
   // ASP.NET Razor / Blazor markup — custom RazorExtractor (links @model/@inject/
   // component tags to their C# types; markup isn't a tree-sitter grammar).
