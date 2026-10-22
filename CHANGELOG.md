@@ -12,6 +12,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Unreal 查询补充类型前缀和源码文件基名候选，优先展示明确目标及相关关系。
+- 支持个人 include/exclude 配置，将被忽略或通过项目内链接接入的插件源码纳入索引、同步和监听。
+- 超大项目查询限制代价高的宽泛搜索，保留精确符号和图查询。
+- Windows 提供可选的本地构建与全局链接脚本，Node 26 及以上不再被 Node 25 的规避规则误拦截。
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

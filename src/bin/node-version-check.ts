@@ -10,7 +10,7 @@
 
 /**
  * Build the bordered banner shown when CodeGraph detects an
- * unsupported Node.js major version (currently 25+). Pinned via unit
+ * unsupported Node.js 25.x runtime. Pinned via unit
  * test so the recovery commands and override instructions can't be
  * silently stripped by future edits.
  *
@@ -73,4 +73,14 @@ export function buildNodeTooOldBanner(nodeVersion: string): string {
     '  CODEGRAPH_ALLOW_UNSAFE_NODE=1 codegraph ...',
     sep,
   ].join('\n');
+}
+
+export type NodeVersionBlockReason = 'too-old' | 'node25-wasm-oom';
+
+/** Classify startup compatibility without rejecting newer unaffected runtimes. */
+export function getNodeVersionBlock(nodeVersion: string): NodeVersionBlockReason | null {
+  const major = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
+  if (major < MIN_NODE_MAJOR) return 'too-old';
+  if (major === 25) return 'node25-wasm-oom';
+  return null;
 }

@@ -55,7 +55,7 @@ condition, and applied globally it hands the engine's suites the browser builds 
 ESM-only and the repo is CJS) is the shared base; note that a workspace project **concatenates**
 the base's `include` with its own, which is why the `ui` project does not `extends` it.
 
-Node engines: `>=20.0.0 <25.0.0`. There is a hard exit on Node 25.x and below 20 (see `src/bin/node-version-check.ts`).
+Node engines: `>=20.0.0 <25.0.0 || >=26.0.0`. There is a hard exit on Node 25.x and below 20 (see `src/bin/node-version-check.ts`).
 
 ## Architecture
 

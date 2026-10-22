@@ -974,8 +974,21 @@ export function removeDirectory(projectRoot: string): void {
     return;
   }
 
-  // Recursively remove directory
-  fs.rmSync(codegraphDir, { recursive: true, force: true });
+  // Keep the local indexing policy in place while removing generated data.
+  // Never follow a symlink masquerading as the private config.
+  const configPath = path.join(codegraphDir, 'indexing.json');
+  let keepConfig = false;
+  try { keepConfig = fs.lstatSync(configPath).isFile(); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (keepConfig) {
+    for (const name of fs.readdirSync(codegraphDir)) {
+      if (name !== 'indexing.json') fs.rmSync(path.join(codegraphDir, name), { recursive: true, force: true });
+    }
+    ensureGitignore(path.join(codegraphDir, '.gitignore'));
+  } else {
+    fs.rmSync(codegraphDir, { recursive: true, force: true });
+  }
 }
 
 /**

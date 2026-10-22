@@ -708,6 +708,18 @@ export interface FindRelevantContextOptions {
   /** Node types to include */
   nodeKinds?: NodeKind[];
 
+  /** Maximum broad FTS terms; exact-symbol lookup still runs (default: unlimited). */
+  maxTextSearchTerms?: number;
+
+  /** Whether broad definition-prefix searches run (default: true). */
+  enableDefinitionPrefixSearch?: boolean;
+
+  /** Whether LIKE-based substring searches run (default: true). */
+  enableSubstringSearch?: boolean;
+
+  /** Whether global dominant-file ranking runs (default: true). */
+  enableDominantFileBoost?: boolean;
+
   /**
    * Extra symbol names to merge in as exact-name search candidates, at a
    * dampened score. Fed by the segment-vocabulary supplement (CodeGraph.

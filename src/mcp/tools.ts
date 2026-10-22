@@ -33,8 +33,8 @@ import {
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import type { Node, Edge, SearchResult, Subgraph, NodeKind, FindRelevantContextOptions } from '../types';
+import { isDistinctiveIdentifier, isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
 import {
@@ -3858,6 +3858,7 @@ export class ToolHandler {
      * the agent took that as the tool having found the wrong method.
      */
     leadingIds: Iterable<string> = [],
+    onlyLeading = false,
   ): string {
     const ROOT_CAP = 5; // only the symbols the query actually targeted
     const FILE_CAP = 4; // caller files listed per symbol before "+N more"
@@ -3867,7 +3868,7 @@ export class ToolHandler {
     ]);
     const rel = (p: string) => p.replace(/\\/g, '/');
 
-    const roots = [...new Set([...leadingIds, ...subgraph.roots])]
+    const roots = [...new Set([...leadingIds, ...(onlyLeading ? [] : subgraph.roots)])]
       .map((id) => subgraph.nodes.get(id))
       .filter((n): n is Node => !!n && MEANINGFUL.has(n.kind))
       .slice(0, ROOT_CAP);
@@ -4102,6 +4103,7 @@ export class ToolHandler {
       budget = getExploreOutputBudget(Infinity);
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
+    const hugeIndex = indexedFileCount >= 100_000 || indexedNodeCount >= 1_000_000;
 
     // File paths named in the query become PINNED files: guaranteed admission,
     // top of the rank order, funded first — and their span is REMOVED from the
@@ -4220,12 +4222,23 @@ export class ToolHandler {
     // that prevents context bloat, so more nodes just means better coverage
     // across entry points (especially for large files like Svelte components).
     // Matching runs on the path-stripped query; `query` stays for display.
-    const subgraph = await cg.findRelevantContext(matchQuery, {
+    const findOptions: FindRelevantContextOptions = {
       searchLimit: 8,
       traversalDepth: 3,
       maxNodes: 200,
       minScore: 0.2,
-    });
+    };
+    if (hugeIndex) {
+      // UE-sized indexes keep exact names, path pins and graph traversal;
+      // broad FTS/LIKE queries and global ranking can dominate their latency.
+      Object.assign(findOptions, {
+        maxTextSearchTerms: 0,
+        enableDefinitionPrefixSearch: false,
+        enableSubstringSearch: false,
+        enableDominantFileBoost: false,
+      });
+    }
+    const subgraph = await cg.findRelevantContext(matchQuery, findOptions);
 
     // Pinned files' symbols enter the gather unconditionally — the agent named
     // the file itself, so its contents ARE the answer regardless of what the
@@ -4239,6 +4252,42 @@ export class ToolHandler {
         .sort((a, b) => a.startLine - b.startLine)
         .slice(0, PINNED_FILE_NODE_CAP)
         .forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
+    }
+
+    // A distinctive basename or an omitted UE U/A/F/I/E prefix still names
+    // code precisely. Keep these anchors local to this query, not the graph.
+    const strongNamedSeedIds = new Set<string>();
+    const strongAnchorTokens = new Set<string>();
+    const strongNamedFileRanks = new Map<string, number>();
+    const strongTypeFiles = new Set<string>();
+    const anchorTokens = [...new Set(matchQuery.split(/[\s,()[\]]+/))].slice(0, 16);
+    const projectNameTokens = cg.getProjectNameTokens();
+    const UE_TYPE_KINDS = new Set(['class', 'struct', 'union', 'interface', 'enum', 'type_alias']);
+    const FILE_OWNED_KINDS = new Set([...UE_TYPE_KINDS, 'trait', 'protocol', 'method', 'function', 'component']);
+    const SOURCE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|hh|inl|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
+    for (const [rank, token] of anchorTokens.entries()) {
+      if (!/^[A-Za-z_$][\w$]{2,}$/.test(token)
+        || !isDistinctiveIdentifier(token) || projectNameTokens.has(normalizeNameToken(token))) continue;
+      const files = cg.searchNodes(token, { limit: 40, kinds: ['file'] })
+        .map((r) => r.node)
+        .filter((n) => SOURCE_EXT.test(n.filePath) && !isTestFile(n.filePath)
+          && n.filePath.split(/[\\/]/).pop()?.replace(SOURCE_EXT, '') === token)
+        .slice(0, 4);
+      const candidates = files.flatMap((file) => cg.getNodesInFile(file.filePath))
+        .filter((n) => FILE_OWNED_KINDS.has(n.kind));
+      if (/^[A-Z][A-Za-z0-9]{3,}$/.test(token) && /[a-z]/.test(token)) {
+        candidates.push(...['U', 'A', 'F', 'I', 'E'].flatMap((prefix) => cg.getNodesByName(prefix + token))
+          .filter((n) => UE_TYPE_KINDS.has(n.kind) && /\.(?:cpp|cc|cxx|h|hpp|hh|inl)$/i.test(n.filePath)
+            && !isTestFile(n.filePath)));
+      }
+      candidates.sort((a, b) => (b.endLine - b.startLine) - (a.endLine - a.startLine));
+      for (const node of candidates.slice(0, 8)) {
+        subgraph.nodes.set(node.id, node);
+        strongNamedSeedIds.add(node.id);
+        strongAnchorTokens.add(token);
+        if (UE_TYPE_KINDS.has(node.kind)) strongTypeFiles.add(node.filePath);
+        if (!strongNamedFileRanks.has(node.filePath)) strongNamedFileRanks.set(node.filePath, rank);
+      }
     }
 
     // EXACT targets: callables the agent pointed at with no ambiguity left — a
@@ -4298,7 +4347,9 @@ export class ToolHandler {
           }
           return list(kept) + (kept.length < words.length ? ' …' : '');
         };
-        explanation += '\nChecked indexed names, signatures, docstrings (FTS prefixes) and live name segments; not all source text.';
+        explanation += hugeIndex
+          ? '\nBroad text, definition-prefix and substring searches are skipped for this large index; checked exact names, UE/file anchors and live name segments.'
+          : '\nChecked indexed names, signatures, docstrings (FTS prefixes) and live name segments; not all source text.';
         if (miss.limited) explanation += '\nWord check limited to 16 words of at most 64 characters.';
         explanation += `\nNo lexical matches for checked words: ${cappedList(miss.unmatched, 250) || '(none)'}.`;
         if (miss.matched.length > 0) {
@@ -4386,17 +4437,20 @@ export class ToolHandler {
       return owned;
     };
 
-    const namedSeedIds = new Set<string>();
+    const namedSeedIds = new Set<string>(strongNamedSeedIds);
+    // Other query tokens remain named targets; a UE/file anchor only replaces
+    // the incidental exact-name collisions of its own token.
+    const independentNamedSeedIds = new Set<string>();
     // The subset of named seeds that earns the named-FIRST sort tier. We still
     // SEED every ≤3-def name (so RWR / flow ranking is unchanged), but only the
     // most-substantive def is tiered — a bare name's unrelated namesakes (Go's
     // `NewClient` = real client + test fake + xds pool) must not fill the tier
     // and crowd out the real answer file (grpc's `dialoptions.go`). Corroborated
     // overloads (the query also named the type) all earn it. (#1064)
-    const tierSeedIds = new Set<string>();
+    const tierSeedIds = new Set<string>(strongNamedSeedIds);
     // Files declaring a TYPE the query named by name — the counter-case guard
     // for the declaration-only penalty (CG-28). Populated in the token loop.
-    const namedTypeFiles = new Set<string>();
+    const namedTypeFiles = new Set<string>(strongTypeFiles);
     {
       const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
@@ -4508,7 +4562,7 @@ export class ToolHandler {
         // token at a hump boundary or as a prefix.
         // Exact-empty + camel-shaped only (bare words keep the NL-stopword
         // guard below), shortest-first, capped so a hot infix can't flood.
-        if (cands.length === 0 && !isQual && /[a-z][A-Z]/.test(t)) {
+        if (!hugeIndex && cands.length === 0 && !isQual && /[a-z][A-Z]/.test(t)) {
           const lcToken = t.toLowerCase();
           cands = cg
             .getNodesByNameSubstring(t, {
@@ -4565,6 +4619,7 @@ export class ToolHandler {
           // named-file sort below. (Previously only NEW injections were marked,
           // so a named symbol FTS already gathered never sorted to the top.)
           namedSeedIds.add(n.id);
+          if (!strongAnchorTokens.has(t)) independentNamedSeedIds.add(n.id);
           // A QUALIFIED name that resolved to a handful of defs is the agent
           // choosing one overload out of a family — `SQLCompiler.as_sql`, not
           // the 109 other `as_sql`s. The bare name keeps the family rules; the
@@ -4727,7 +4782,9 @@ export class ToolHandler {
       // tier says how the symbol reached us, the kind weight says whether the
       // match is evidence. A file whose only claim is an unused local `explore`
       // constant is a name collision, not an answer (#1500).
-      if (namedSeedIds.has(node.id)) {
+      if (strongNamedSeedIds.has(node.id)) {
+        group.score += 90 * relevanceWeight(node, true);
+      } else if (namedSeedIds.has(node.id)) {
         group.score += 50 * relevanceWeight(node, true);
       } else if (entryNodeIds.has(node.id)) {
         group.score += 10 * relevanceWeight(node, true);
@@ -5040,6 +5097,20 @@ export class ToolHandler {
       if (aPin !== bPin) return bPin - aPin;
       if (aPin && bPin) return (pinnedOrder.get(a[0]) ?? 0) - (pinnedOrder.get(b[0]) ?? 0);
 
+      // Inferred UE anchors follow explicit file/line/qualified targets and
+      // precede incidental exact-name collisions in other files.
+      if (strongNamedSeedIds.size > 0) {
+        const aExact = a[1].nodes.some((n) => exactNodeIds.has(n.id)) || anchorSpans.has(a[0]);
+        const bExact = b[1].nodes.some((n) => exactNodeIds.has(n.id)) || anchorSpans.has(b[0]);
+        if (aExact !== bExact) return aExact ? -1 : 1;
+        const aStrong = strongNamedFileRanks.get(a[0]);
+        const bStrong = strongNamedFileRanks.get(b[0]);
+        if (aStrong !== undefined || bStrong !== undefined) {
+          const rank = (aStrong ?? Number.MAX_SAFE_INTEGER) - (bStrong ?? Number.MAX_SAFE_INTEGER);
+          if (rank !== 0) return rank;
+        }
+      }
+
       // Agent-named files next (it asked for a symbol defined here by name).
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
@@ -5106,13 +5177,37 @@ export class ToolHandler {
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
-    const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
+    const blastLeadingIds = strongNamedSeedIds.size > 0
+      ? [...exactNodeIds, ...independentNamedSeedIds, ...strongNamedSeedIds]
+      : exactNodeIds;
+    const blastRadius = this.buildBlastRadiusSection(
+      cg, subgraph, blastLeadingIds, strongNamedSeedIds.size > 0,
+    );
     if (blastRadius) lines.push(blastRadius);
 
     // Relationship map — show how symbols connect
-    const significantEdges = subgraph.edges.filter(e =>
-      e.kind !== 'contains' // skip contains — it's implied by file grouping
-    );
+    const relationshipAnchorFiles = new Set([
+      ...strongNamedFileRanks.keys(), ...pinnedFiles,
+      ...[...exactNodeIds, ...independentNamedSeedIds].map((id) => subgraph.nodes.get(id)?.filePath)
+        .filter((file): file is string => file !== undefined),
+    ]);
+    const significantEdges = subgraph.edges
+      .filter((e) => e.kind !== 'contains') // implied by file grouping
+      .map((edge, index) => {
+        const source = subgraph.nodes.get(edge.source);
+        const target = subgraph.nodes.get(edge.target);
+        let score = 0;
+        if (source && target && strongNamedSeedIds.size > 0) {
+          if (exactNodeIds.has(source.id) || exactNodeIds.has(target.id)) score += 900;
+          if (strongNamedSeedIds.has(source.id) || strongNamedSeedIds.has(target.id)) score += 600;
+          if (independentNamedSeedIds.has(source.id) || independentNamedSeedIds.has(target.id)) score += 300;
+          if (relationshipAnchorFiles.has(source.filePath) || relationshipAnchorFiles.has(target.filePath)) score += 100;
+        }
+        return { edge, score, index };
+      })
+      .filter(({ score }) => strongNamedSeedIds.size === 0 || score > 0)
+      .sort((a, b) => b.score - a.score || a.index - b.index)
+      .map(({ edge }) => edge);
 
     if (budget.includeRelationships && significantEdges.length > 0) {
       lines.push('**Relationships**');

@@ -37,7 +37,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
 import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
-import { logDebug, logWarn } from '../errors';
+import { getIndexingConfigPath } from '../indexing-config';
+import { ConfigError, logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
@@ -83,6 +84,9 @@ const SCOPED_SYNC_MAX_PENDING = 500;
 const EXHAUSTION_REASON =
   'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` ' +
   '(or install git sync hooks) to refresh the graph after changes.';
+
+const INVALID_INDEXING_CONFIG_REASON =
+  'Invalid private indexing.json; auto-sync disabled. Fix the config and restart the watcher, or run `codegraph sync`.';
 
 /**
  * Actionable, NON-fatal warning for Linux inotify watch-count exhaustion.
@@ -267,6 +271,7 @@ export interface PendingFile {
 export class FileWatcher {
   /** macOS/Windows: the single recursive watcher. Null on Linux. */
   private recursiveWatcher: fs.FSWatcher | null = null;
+  private indexingConfigWatcher: fs.FSWatcher | null = null;
   /** Linux directory watches / macOS and Windows supplemental symlink streams. */
   private dirWatchers = new Map<string, fs.FSWatcher>();
   /** Set once the per-directory watch cap is hit, so we log only once. */
@@ -357,6 +362,7 @@ export class FileWatcher {
   private ignoreMatcher: ScopeIgnore | null = null;
 
   private readonly projectRoot: string;
+  private readonly indexingConfigRelative: string;
   private readonly debounceMs: number;
   private readonly syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
@@ -378,6 +384,7 @@ export class FileWatcher {
     isFileStateCurrent?: (relativePath: string) => boolean
   ) {
     this.projectRoot = projectRoot;
+    this.indexingConfigRelative = normalizePath(path.relative(projectRoot, getIndexingConfigPath(projectRoot)));
     this.syncFn = syncFn;
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
@@ -411,10 +418,9 @@ export class FileWatcher {
       return false;
     }
 
-    // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
-    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
-
     try {
+      // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
+      this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
       if (this.inertForTests) {
         // Test-only: install no OS watcher; the seam drives events instead.
         this.inert = true;
@@ -422,6 +428,7 @@ export class FileWatcher {
         this.startRecursive();
       } else {
         this.refreshWatchTree();
+        this.startIndexingConfigWatch();
       }
 
       // The per-directory (Linux) path catches watch-resource exhaustion inside
@@ -453,11 +460,37 @@ export class FileWatcher {
       // (permission denied, missing directory) keeps the prior quiet-stop.
       if (isWatchResourceExhaustion(err)) {
         this.degrade(EXHAUSTION_REASON, { error: String(err) });
+      } else if (err instanceof ConfigError) {
+        this.degrade(INVALID_INDEXING_CONFIG_REASON, { error: err.message });
       } else {
         logWarn('Could not start file watcher', { error: String(err) });
         this.stop();
       }
       return false;
+    }
+  }
+
+  /** Linux's tree walk excludes graph data; watch only its config entry, never DB churn. */
+  private startIndexingConfigWatch(): void {
+    if (this.stopped || this.degradedReason) return;
+    const configPath = getIndexingConfigPath(this.projectRoot);
+    if (!fs.existsSync(path.dirname(configPath))) return;
+    try {
+      this.indexingConfigWatcher = watchImpl(path.dirname(configPath), { persistent: true }, (_event, filename) => {
+        if (!this.stopped && (filename == null || String(filename) === path.basename(configPath))) {
+          this.handleChange(this.indexingConfigRelative);
+        }
+      });
+      this.indexingConfigWatcher.on('error', (err: unknown) => {
+        this.degrade('Private indexing config watch failed; restart the watcher or run `codegraph sync`.', { error: String(err) });
+      });
+    } catch (err) {
+      if (isInotifyWatchExhaustion(err)) {
+        this.warnInotifyLimit({ dir: path.dirname(configPath) });
+        return;
+      }
+      // Standalone FileWatcher users may not have initialized a graph directory.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   }
 
@@ -467,8 +500,9 @@ export class FileWatcher {
    * it maps straight to a project-relative path.
    */
   private startRecursive(): void {
+    const watchRoot = process.platform === 'win32' ? fs.realpathSync.native(this.projectRoot) : this.projectRoot;
     this.recursiveWatcher = watchImpl(
-      this.projectRoot,
+      watchRoot,
       { recursive: true, persistent: true },
       (_event, filename) => this.handleDirEvent(this.projectRoot, filename)
     );
@@ -550,7 +584,10 @@ export class FileWatcher {
 
     let w: fs.FSWatcher;
     try {
-      w = watchImpl(dir, { persistent: true, recursive }, (_event, filename) =>
+      // libuv can abort on a Windows junction's logical/8.3 path (#770).
+      // Watch its canonical target and keep events mapped to the logical dir.
+      const watchPath = process.platform === 'win32' ? fs.realpathSync.native(dir) : dir;
+      w = watchImpl(watchPath, { persistent: true, recursive }, (_event, filename) =>
         this.handleDirEvent(dir, filename)
       );
     } catch (err) {
@@ -598,7 +635,7 @@ export class FileWatcher {
     // Churn under an ignored directory (node_modules, dist, .git) is dropped
     // before any per-event fs call; `.git/info/exclude` still reaches the scope
     // refresh in handleChange (#1728).
-    if (rel !== '.git/info/exclude' && this.shouldIgnoreDir(path.dirname(full))) return;
+    if (rel !== '.git/info/exclude' && rel !== this.indexingConfigRelative && this.shouldIgnoreDir(path.dirname(full))) return;
     try {
       if (fs.statSync(full).isDirectory()) {
         if (this.shouldIgnoreDir(full)) return;
@@ -623,6 +660,10 @@ export class FileWatcher {
    */
   private handleChange(rel: string): void {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
+    if (rel === this.indexingConfigRelative) {
+      this.refreshScope(rel);
+      return;
+    }
     // `.git/info/exclude` is otherwise always-ignored with the rest of `.git/`,
     // but it feeds `buildScopeIgnore` — allow it through as a scope refresh
     // when the platform delivers the event (recursive watchers may; Linux
@@ -704,7 +745,13 @@ export class FileWatcher {
    */
   private refreshScope(rel: string): void {
     logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
-    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    try {
+      this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      this.degrade(INVALID_INDEXING_CONFIG_REASON, { error: error.message });
+      return;
+    }
     this.scheduleTreeRefresh();
     this.needsFullScan = true;
     this.scheduleSync();
@@ -879,6 +926,10 @@ export class FileWatcher {
         /* already closed */
       }
       this.recursiveWatcher = null;
+    }
+    if (this.indexingConfigWatcher) {
+      try { this.indexingConfigWatcher.close(); } catch { /* already closed */ }
+      this.indexingConfigWatcher = null;
     }
     for (const w of this.dirWatchers.values()) {
       try {

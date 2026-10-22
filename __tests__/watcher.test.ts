@@ -1295,7 +1295,8 @@ describe('FileWatcher', () => {
       watchers.push(watcher);
       expect(watcher.start()).toBe(true);
       expect(opened.some(d => d.includes('node_modules'))).toBe(false);
-      expect(opened.filter(d => fs.realpathSync(d) === fs.realpathSync(dir))).toHaveLength(1);
+      const realpath = process.platform === 'win32' ? fs.realpathSync.native : fs.realpathSync;
+      expect(opened.filter(d => realpath(d) === realpath(dir))).toHaveLength(1);
       watcher.stop();
       expect(closed.sort()).toEqual(opened.sort());
       expect(watcher.start()).toBe(true);

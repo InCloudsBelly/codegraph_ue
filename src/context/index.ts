@@ -180,6 +180,10 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   minScore: 0.3,
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
+  maxTextSearchTerms: Number.POSITIVE_INFINITY,
+  enableDefinitionPrefixSearch: true,
+  enableSubstringSearch: true,
+  enableDominantFileBoost: true,
   seedNames: [],         // Segment-vocab supplement — filled by the facade
 };
 
@@ -544,7 +548,7 @@ export class ContextBuilder {
     // When the user writes "REST", "bulk", or "allocation", they usually mean classes
     // like RestController, BulkRequest, AllocationService — not nodes named exactly that.
     // Also tries stem variants: "caching" → "cache" finds Cache, CacheBuilder.
-    if (symbolsFromQuery.length > 0) {
+    if (opts.enableDefinitionPrefixSearch && symbolsFromQuery.length > 0) {
       const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
       // Expand symbols with stem variants for broader definition matching
@@ -638,8 +642,11 @@ export class ContextBuilder {
       // only FTS hits are the import nodes this channel excludes, so the search
       // fell through to the fuzzy fallback and returned whatever program name
       // sat within edit distance (`CVACT01Y` → `CBACT01C`).
-      const searchTerms = extractSearchTerms(query)
+      let searchTerms = extractSearchTerms(query)
         .filter((term) => !copybooks.members.has(term.toUpperCase()));
+      if (Number.isFinite(opts.maxTextSearchTerms)) {
+        searchTerms = searchTerms.slice(0, Math.max(0, opts.maxTextSearchTerms));
+      }
       if (searchTerms.length > 0) {
         // Search each term individually to get broader coverage,
         // then boost results that match multiple terms
@@ -734,23 +741,25 @@ export class ContextBuilder {
     // results that share a directory prefix with the dominant file's
     // directory so the core file's siblings outrank sibling-package
     // extensions.
-    try {
-      const dominant = this.queries.getDominantFile?.();
-      if (dominant && dominant.edgeCount >= 3 * dominant.nextEdgeCount) {
-        // Take the directory of the dominant file (everything up to the
-        // last slash). For `lib/sinatra/base.rb` → `lib/sinatra/`.
-        const slash = dominant.filePath.lastIndexOf('/');
-        if (slash > 0) {
-          const coreDir = dominant.filePath.slice(0, slash + 1);
-          for (const result of searchResults) {
-            if (result.node.filePath.startsWith(coreDir)) {
-              result.score += 25;
+    if (opts.enableDominantFileBoost) {
+      try {
+        const dominant = this.queries.getDominantFile?.();
+        if (dominant && dominant.edgeCount >= 3 * dominant.nextEdgeCount) {
+          // Take the directory of the dominant file (everything up to the
+          // last slash). For `lib/sinatra/base.rb` → `lib/sinatra/`.
+          const slash = dominant.filePath.lastIndexOf('/');
+          if (slash > 0) {
+            const coreDir = dominant.filePath.slice(0, slash + 1);
+            for (const result of searchResults) {
+              if (result.node.filePath.startsWith(coreDir)) {
+                result.score += 25;
+              }
             }
           }
         }
+      } catch {
+        // SQL failure — fall through, scoring works without the boost
       }
-    } catch {
-      // SQL failure — fall through, scoring works without the boost
     }
 
     // Step 5a: Multi-term co-occurrence re-ranking (applied BEFORE truncation).
@@ -843,7 +852,7 @@ export class ContextBuilder {
     // FTS can't find "Search" inside "TransportSearchAction" (one FTS token).
     // LIKE reliably finds these substring matches. Results are appended with
     // guaranteed slots so they don't compete with higher-scoring prefix matches.
-    if (symbolsFromQuery.length > 0) {
+    if (opts.enableSubstringSearch && symbolsFromQuery.length > 0) {
       const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
       // Callable kinds participate too: in service-layer codebases the

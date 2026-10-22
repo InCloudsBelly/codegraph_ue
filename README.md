@@ -1,3 +1,25 @@
+## 个人维护的 Unreal 增强分支
+
+此仓库在官方 CodeGraph 基础上维护 Unreal 大型工程需要的查询和索引适配。保留官方包名和版本，以 Git 提交及 SelfWorkFlow 子模块锁确定增强版本；从 npm 安装同名官方包不会获得本分支的增强。
+
+- 查询时补充 Unreal `U/A/F/I/E` 类型前缀候选与源码文件基名锚点，保留显式文件路径和行号目标的优先级。
+- 超大索引限制昂贵的宽泛搜索，保留精确符号查询及图关系查询。
+- 通过默认数据目录中的 `.codegraph/indexing.json` 配置个人 `include` / `exclude`，把被 Git 忽略或经项目内链接接入的插件源码纳入索引、同步和监听；Git 元数据和索引目录仍受保护。
+- Windows 提供可选的 `scripts\local-install.bat`，构建后执行全局 npm link；`--undo` 安装 package.json 声明的官方基础版本，不代表恢复此前未知的全局版本。SelfWorkFlow 接入使用固定子模块构建，无需运行此全局链接脚本。
+
+例如，个人插件源码范围可配置为：
+
+```json
+{
+  "include": ["Client/Plugins/**"],
+  "exclude": ["Engine/Source/ThirdParty/**"]
+}
+```
+
+源码构建使用 `npm ci`、`npm run build`。本分支基于官方提交 `7dfef8451fc9d937cb4ffc9f7ec2a4063f9898d2`，迁移旧分支 `1.3.1-ks.7` 中的相关行为，同时保留官方新版已有的宏解析、文件目标和查询优化；不覆盖为旧版实现。后续维护应合并官方源码，再运行 UE 回归并更新 SelfWorkFlow 的子模块提交和锁文件。下方官方文档中的 `codegraph upgrade` 更新的是官方发行版，不是这个固定源码分支。
+
+---
+
 <div align="center">
 
 # CodeGraph

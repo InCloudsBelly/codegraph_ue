@@ -26,8 +26,9 @@ import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { getIndexingConfigPath, loadIndexingConfig } from '../indexing-config';
 import { isCodeGraphDataDir } from '../directory';
-import { logDebug, logWarn } from '../errors';
+import { ConfigError, logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks';
@@ -605,7 +606,7 @@ function loadIncludeIgnoredMatcher(rootDir: string): Ignore | null {
  * everywhere). Built once per scan/sync/scope operation from the scan root.
  */
 function loadExcludeMatcher(rootDir: string): Ignore | null {
-  const patterns = loadExcludePatterns(rootDir);
+  const patterns = [...loadExcludePatterns(rootDir), ...loadIndexingConfig(rootDir).exclude];
   return patterns.length > 0 ? ignore().add(patterns) : null;
 }
 
@@ -685,6 +686,7 @@ function collectIncludedFiles(
   exclude: Ignore | null,
   roots: string[],
   overrides: Record<string, Language>,
+  allowDefaultIgnored = false,
 ): Set<string> {
   const out = new Set<string>();
   const defaults = defaultsOnlyIgnore();
@@ -692,7 +694,7 @@ function collectIncludedFiles(
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
     if (isDir) {
-      if (defaults.ignores(rel + '/')) return; // never node_modules/dist/… via include
+      if (!allowDefaultIgnored && defaults.ignores(rel + '/')) return;
       // An explicit `exclude` always wins over `include`; prune the whole subtree
       // here so a large excluded dir (a committed frontend's own vendored deps,
       // build output, …) is never walked — the per-file guard below still catches
@@ -700,7 +702,7 @@ function collectIncludedFiles(
       if (exclude && exclude.ignores(rel + '/')) return;
       walk(abs);
     } else {
-      if (defaults.ignores(rel)) return;
+      if (!allowDefaultIgnored && defaults.ignores(rel)) return;
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
       if (!isSourceFile(rel, overrides, rootDir)) return;
@@ -709,6 +711,7 @@ function collectIncludedFiles(
   };
 
   function walk(absDir: string): void {
+    if (isHardIgnoredScopePath(normalizePath(path.relative(rootDir, absDir)))) return;
     let realDir: string;
     try {
       realDir = fs.realpathSync(absDir);
@@ -756,9 +759,21 @@ function collectIncludedFiles(
  */
 function collectIncludedFilesForRoot(rootDir: string): Set<string> {
   const include = loadIncludeMatcher(rootDir);
-  if (!include) return new Set();
-  const roots = includeStaticRoots(loadIncludePatterns(rootDir));
-  return collectIncludedFiles(rootDir, include, loadExcludeMatcher(rootDir), roots, loadExtensionOverrides(rootDir));
+  const local = loadIndexingConfig(rootDir);
+  if (!include && local.include.length === 0) return new Set();
+  const exclude = loadExcludeMatcher(rootDir);
+  const overrides = loadExtensionOverrides(rootDir);
+  const files = include
+    ? collectIncludedFiles(rootDir, include, exclude, includeStaticRoots(loadIncludePatterns(rootDir)), overrides)
+    : new Set<string>();
+  // Private opt-ins may revive soft defaults for first-party UE/P4 source;
+  // git internals, graph data directories and explicit excludes still win.
+  if (local.include.length > 0) {
+    for (const file of collectIncludedFiles(rootDir, ignore().add(local.include), exclude, includeStaticRoots(local.include), overrides, true)) {
+      files.add(file);
+    }
+  }
+  return files;
 }
 
 /**
@@ -935,6 +950,10 @@ export function preloadLanguagesForFiles(
   return languages;
 }
 
+function isHardIgnoredScopePath(rel: string): boolean {
+  return rel.split('/').some(segment => segment === '.git' || isCodeGraphDataDir(segment));
+}
+
 export class ScopeIgnore {
   private embedded: Array<{ root: string; matcher: Ignore }>;
   private defaults: Ignore = defaultsOnlyIgnore();
@@ -958,16 +977,26 @@ export class ScopeIgnore {
      */
     private include: Ignore | null = null,
     private includeRoots: string[] = [],
+    private privateInclude: Ignore | null = null,
+    private privateIncludeRoots: string[] = [],
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
   }
 
   ignores(rel: string): boolean {
+    if (isHardIgnoredScopePath(rel)) return true;
     // User `exclude` (#999) is checked first and against the full root-relative
     // path: it must drop git-TRACKED paths (which `.gitignore` can't) and apply
     // everywhere, including ancestors of embedded repos.
     if (this.exclude && this.exclude.ignores(rel)) return true;
+    if (this.privateInclude) {
+      if (rel.endsWith('/')) {
+        if (this.privateIncludeRoots.some(r => r.startsWith(rel) || rel.startsWith(r))) return false;
+      } else if (this.privateInclude.ignores(rel)) {
+        return false;
+      }
+    }
     // User `include`: force first-party source in despite `.gitignore`. Never
     // resurfaces a built-in default-ignored dir (node_modules/dist/…), so an
     // include pattern can't accidentally pull in dependency/build trees.
@@ -1004,6 +1033,7 @@ export class ScopeIgnore {
  * skip rediscovery; otherwise they're discovered here (the watcher path).
  */
 export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
+  const local = loadIndexingConfig(rootDir);
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
   const include = loadIncludeMatcher(rootDir);
   // Root matcher already has defaults + root `.gitignore` + info/exclude +
@@ -1019,6 +1049,8 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
     loadExcludeMatcher(rootDir),
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
+    local.include.length > 0 ? ignore().add(local.include) : null,
+    includeStaticRoots(local.include),
   );
 }
 
@@ -1404,6 +1436,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
     return visible;
   } catch (error) {
+    if (error instanceof ConfigError) throw error;
     // Any failure here (git missing, a `git rev-parse`/`ls-files` timeout or
     // buffer overrun under load, an unreadable repo, unsupported flag combo on
     // older git, etc.) silently sent every caller to `scanDirectoryWalk` with
@@ -1519,6 +1552,10 @@ function gitCommittedChangesSince(repoDir: string, sinceCommit: string): string[
  * working-tree diff is the whole of what they wanted. (#1829)
  */
 export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null): boolean {
+  const local = loadIndexingConfig(rootDir);
+  // Git cannot report source kept only in an ignored P4 workspace, nor edits
+  // to this ignored config that change which indexed paths should be removed.
+  if (local.include.length > 0 || local.exclude.length > 0) return false;
   const head = getGitHeadSha(rootDir);
   if (head == null) return true; // no commits (or not a git repo — caller handles that)
   if (!sinceCommit) return false;
@@ -1983,6 +2020,7 @@ export class ExtractionOrchestrator {
     const gitDir = resolveGitDir(this.rootDir);
     const key = [
       PROJECT_CONFIG_FILENAME,
+      getIndexingConfigPath(this.rootDir),
       '.gitignore',
       gitDir ? path.join(gitDir, 'info', 'exclude') : '',
     ]

@@ -58,6 +58,8 @@ calls; a grep/read exploration is dozens.
 - Qualified symbol names accept dots, \`::\`, or slashes, including containers whose names contain dots (for example, \`AppWeb.Format.group\`).
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.
 - Explore matches names and indexed code words lexically, not by meaning; an empty result reports word matches and may suggest indexed candidate names to retry with \`codegraph_explore\`.
+- For distinctive C++ type names, explore may infer an omitted Unreal U/A/F/I/E prefix as a contextual anchor; explicit file/line targets keep priority. Inferred anchors do not substitute exact named-symbol flow endpoints.
+- Very large indexes prioritize exact-symbol and graph retrieval instead of broad text scans.
 
 ## Anti-patterns
 

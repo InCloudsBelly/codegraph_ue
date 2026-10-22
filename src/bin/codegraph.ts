@@ -55,12 +55,13 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
+import { getIndexingConfigStatus } from '../indexing-config';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 import { ansiColorsEnabled } from '../ui/color';
 
-import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { buildNode25BlockBanner, buildNodeTooOldBanner, getNodeVersionBlock } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { installCommandSupervision, watchParent } from './command-supervision';
@@ -109,8 +110,8 @@ const importESM = new Function('specifier', 'return import(specifier)') as
 // Hard-exit before any WASM work; allow override via env var for users
 // who patched V8 themselves or want to test a future fix.
 const nodeVersion = process.versions.node;
-const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
-if (nodeMajor >= 25) {
+const nodeVersionBlock = getNodeVersionBlock(nodeVersion);
+if (nodeVersionBlock === 'node25-wasm-oom') {
   process.stderr.write(buildNode25BlockBanner(nodeVersion) + '\n');
   if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
     process.exit(1);
@@ -119,8 +120,8 @@ if (nodeMajor >= 25) {
 }
 // Enforce the supported Node floor. `engines` in package.json only *warns* on
 // install (unless engine-strict), so hard-block here to actually keep users off
-// unsupported versions. Mirrors the 25+ block above. See package.json `engines`.
-if (nodeMajor < MIN_NODE_MAJOR) {
+// unsupported versions. Mirrors the Node 25 block above. See package.json `engines`.
+if (nodeVersionBlock === 'too-old') {
   process.stderr.write(buildNodeTooOldBanner(nodeVersion) + '\n');
   if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
     process.exit(1);
@@ -1093,6 +1094,7 @@ program
   .option('-j, --json', 'Output as JSON')
   .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    const indexingConfig = getIndexingConfigStatus(projectPath);
     // The directory the user actually ran from, before walking up to the index
     // root. Used to detect when the resolved index lives in a different git
     // working tree (e.g. a nested worktree borrowing the main checkout's index).
@@ -1107,6 +1109,7 @@ program
             version: packageJson.version,
             projectPath,
             indexPath: getCodeGraphDir(projectPath),
+            indexingConfig,
             lastIndexed: null,
           }));
           return;
@@ -1121,7 +1124,8 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
       const stats = cg.getStats();
-      const changes = cg.getChangedFiles();
+      // Invalid scope configuration must remain diagnosable without scanning it.
+      const changes = indexingConfig.error ? null : cg.getChangedFiles();
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
 
@@ -1143,6 +1147,7 @@ program
           version: packageJson.version,
           projectPath,
           indexPath: getCodeGraphDir(projectPath),
+          indexingConfig,
           lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
@@ -1153,11 +1158,11 @@ program
           journalMode,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
-          pendingChanges: {
+          pendingChanges: changes ? {
             added: changes.added.length,
             modified: changes.modified.length,
             removed: changes.removed.length,
-          },
+          } : null,
           worktreeMismatch: worktreeMismatch
             ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
             : null,
@@ -1259,8 +1264,9 @@ program
       console.log();
 
       // Pending changes
-      const totalChanges = changes.added.length + changes.modified.length + changes.removed.length;
-      if (totalChanges > 0) {
+      if (indexingConfig.error) warn(indexingConfig.error);
+      const totalChanges = changes ? changes.added.length + changes.modified.length + changes.removed.length : null;
+      if (changes && totalChanges !== null && totalChanges > 0) {
         console.log(chalk.bold('Pending Changes:'));
         if (changes.added.length > 0) {
           console.log(`  Added:     ${changes.added.length} files`);
