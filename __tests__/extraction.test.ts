@@ -29,7 +29,7 @@ function createTempDir(): string {
 // Clean up temporary directory
 function cleanupTempDir(dir: string): void {
   if (fs.existsSync(dir)) {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   }
 }
 

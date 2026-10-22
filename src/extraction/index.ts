@@ -27,6 +27,7 @@ import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { getIndexingConfigPath, loadIndexingConfig } from '../indexing-config';
+import { GitIgnoredPaths } from './git-ignored-paths';
 import { isCodeGraphDataDir } from '../directory';
 import { ConfigError, logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -979,6 +980,7 @@ export class ScopeIgnore {
     private includeRoots: string[] = [],
     private privateInclude: Ignore | null = null,
     private privateIncludeRoots: string[] = [],
+    private gitIgnoredPaths?: GitIgnoredPaths,
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
@@ -1023,7 +1025,7 @@ export class ScopeIgnore {
     if (rel.endsWith('/') && this.embedded.some(({ root }) => root.startsWith(rel))) {
       return false;
     }
-    return this.rootMatcher.ignores(rel);
+    return this.rootMatcher.ignores(rel) || (this.gitIgnoredPaths?.ignores(rel) ?? false);
   }
 }
 
@@ -1040,9 +1042,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
   // core.excludesFile. Seed ignored-untracked directories from git so nested
   // `.gitignore` effects prune the watcher identically to the indexer (#1728).
   const rootMatcher = buildDefaultIgnore(rootDir);
-  for (const dir of listGitIgnoredDirectories(rootDir)) {
-    rootMatcher.add(dir);
-  }
+  const gitIgnoredPaths = new GitIgnoredPaths(rootMatcher, listGitIgnoredDirectories(rootDir));
   return new ScopeIgnore(
     rootMatcher,
     roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
@@ -1051,6 +1051,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
     local.include.length > 0 ? ignore().add(local.include) : null,
     includeStaticRoots(local.include),
+    gitIgnoredPaths,
   );
 }
 
@@ -3421,6 +3422,11 @@ export class ExtractionOrchestrator {
    * conservatism as {@link resurrectStaleResolutionEdges}: an edge without a
    * refName stamp is never deleted.
    */
+  resurrectResolutionEdgesFromFiles(language: Language, files: string[]): number {
+    return this.reopenEdges(this.queries.getResolutionEdgesFromFiles(language, files)) +
+      this.queries.requeueFailedReferencesFromFiles(language, files);
+  }
+
   resurrectResolutionEdgesForLanguage(language: Language): number {
     return (
       this.reopenEdges(this.queries.getResolutionEdgesBySourceLanguage(language)) +
@@ -3528,7 +3534,9 @@ export class ExtractionOrchestrator {
      */
     backpressure?: () => Promise<void> | null,
     /** Inspect changed inputs before deletion/re-extraction cascades their edges. */
-    onFileChange?: (filePath: string, content?: string) => void
+    onFileChange?: (filePath: string, content?: string) => void,
+    /** A replaced physical root invalidates the stat shortcut for its logical files. */
+    forceContentCheck?: ReadonlySet<string>
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
@@ -3702,7 +3710,7 @@ export class ExtractionOrchestrator {
       if (tracked && !neverParsed) {
         try {
           const stat = fs.statSync(fullPath);
-          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
+          if (!forceContentCheck?.has(filePath) && stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
             continue;
           }
         } catch (error) {

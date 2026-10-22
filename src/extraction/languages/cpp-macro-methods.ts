@@ -399,7 +399,7 @@ function cppMacroDirectives(source: string): { macros: CppMacro[]; undefs: Array
 }
 
 /** The invocations of the macros `names` in code (not in a directive, comment or literal), with their arguments. */
-function cppMacroInvocations(source: string, names: ReadonlySet<string>): Array<{ name: string; at: number; end: number; args: string[] }> {
+export function cppMacroInvocations(source: string, names: ReadonlySet<string>): Array<{ name: string; at: number; end: number; args: string[] }> {
   const calls: Array<{ name: string; at: number; end: number; args: string[] }> = [];
   for (const word of cppCodeScan(source, names).words) {
     const open = skipBlankAndComments(source, word.end);

@@ -62,7 +62,7 @@ import {
   type FlowStep,
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
-import { measurePendingChanges } from './index-freshness';
+import { measurePendingChanges, measureCppIncludeEnvironment } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
@@ -2681,6 +2681,18 @@ export class ToolHandler {
     return result;
   }
 
+  private async withCppIncludeNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
+    let cg: CodeGraph;
+    try { cg = this.getCodeGraph(projectPath); } catch { return result; }
+    if (!cg.hasCppIncludeFiles?.()) return result;
+    const state = await measureCppIncludeEnvironment(cg.getProjectRoot());
+    if (state?.observed && state.complete && !state.changed) return result;
+    const [head, ...tail] = result.content;
+    if (!head || head.type !== 'text') return result;
+    const reason = state?.changed ? 'changed' : 'unverified';
+    return { ...result, content: [{ type: 'text', text: `> C/C++ include environment is ${reason}; graph relationships may be stale. Run codegraph sync and check status before trusting dependency or flow results.\n\n${head.text}` }, ...tail] };
+  }
+
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
 
@@ -2909,7 +2921,7 @@ export class ToolHandler {
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      return this.withCppIncludeNotice(this.withStalenessNotice(withWorktree, args.projectPath as string | undefined), args.projectPath as string | undefined);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
@@ -8154,6 +8166,10 @@ export class ToolHandler {
     // not block the shared daemon's transport (#1959). Unknown is never zero.
     const lastIndexedAt = cg.getLastIndexedAt();
     const changes = await measurePendingChanges(cg.getProjectRoot());
+    if (cg.hasCppIncludeFiles?.()) {
+      const environment = await measureCppIncludeEnvironment(cg.getProjectRoot());
+      lines.push(`**C/C++ include environment:** ${environment?.observed && environment.complete && !environment.changed ? 'verified' : environment?.changed ? 'changed (run codegraph sync)' : 'unverified (do not assume the index is current)'}`);
+    }
     lines.push(
       `**Latest file indexed:** ${lastIndexedAt == null ? 'never' : new Date(lastIndexedAt).toISOString()}`,
       changes

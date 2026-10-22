@@ -20,6 +20,7 @@ import { tryKernelExtractRaw } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
 import { mayDefineCppMacroMethods } from './languages/cpp-macro-methods';
+import { mayHaveUnrealReflection } from './languages/ue-reflection';
 import type { Language, ExtractionResult } from '../types';
 
 // Emscripten prints `Aborted()` (and a follow-up RuntimeError diag
@@ -101,7 +102,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
               language
             ).some((fw) => !!fw.extract)
           : false;
-      if (!frameworksNeedDecode && !(language === 'cpp' && mayDefineCppMacroMethods(content!))) {
+      if (!frameworksNeedDecode && !(language === 'cpp' && (mayDefineCppMacroMethods(content!) || mayHaveUnrealReflection(content!)))) {
         const raw = tryKernelExtractRaw(filePath!, content!, language);
         if (raw) {
           result = {

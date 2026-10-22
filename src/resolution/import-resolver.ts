@@ -376,6 +376,11 @@ function resolveImportPathUncached(
   language: Language,
   context: ResolutionContext
 ): string | null {
+  if (language === 'c' || language === 'cpp') {
+    const scoped = context.resolveCppInclude?.(fromFile, importPath);
+    if (scoped && scoped.status !== 'no-environment') return scoped.status === 'resolved' ? scoped.file : null;
+  }
+
   // COBOL COPY/EXEC SQL INCLUDE names a copybook member, not a path — the
   // compiler searches a library, so we match against indexed file basenames.
   // Must run before isExternalImport: a bare member name would otherwise be
@@ -2896,6 +2901,12 @@ export function resolveViaImport(
   // edge — resolveViaImport's symbol lookup below would search the
   // resolved file for a symbol named like the file extension and fail.
   if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+    const scoped = context.resolveCppInclude?.(ref.filePath, ref.referenceName, 'unknown', ref.line);
+    if (scoped && scoped.status !== 'no-environment') {
+      if (scoped.status !== 'resolved') return null;
+      const fileNode = context.getNodesInFile(scoped.file).find(n => n.kind === 'file');
+      return fileNode ? { original: ref, targetNodeId: fileNode.id, confidence: 0.95, resolvedBy: 'import', metadata: { cppIncludeEnvironment: scoped.environment } } : null;
+    }
     // C/C++ quoted includes (`#include "X.h"`) resolve relative to the
     // INCLUDING file's own directory first (the C standard's quoted-include
     // search order). Prefer a same-directory header over an -I directory or a

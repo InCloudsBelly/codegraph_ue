@@ -229,6 +229,8 @@ function resolveInclude(
   context: ResolutionContext,
   cache: Cache
 ): string | null {
+  const scoped = context.resolveCppInclude?.(file, spec, quote === '"' ? '"' : '<');
+  if (scoped && scoped.status !== 'no-environment') return scoped.status === 'resolved' ? scoped.file : null;
   const key = `${language}\0${file}\0${quote}${spec}`;
   const cached = cache.includes.get(key);
   if (cached !== undefined) return cached;

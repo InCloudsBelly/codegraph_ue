@@ -24,6 +24,7 @@ import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
+import { appendUnrealReflection } from './languages/ue-reflection';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
@@ -745,15 +746,17 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
+  private originalSource: string;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean }
+    options?: { sourceIsPreParsed?: boolean; originalSource?: string }
   ) {
     this.filePath = filePath;
     this.source = source;
+    this.originalSource = options?.originalSource ?? source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
@@ -866,6 +869,12 @@ export class TreeSitterExtractor {
       // kernel reads the same (kernel/index.ts and the parse worker's transport).
       this.unresolvedReferences.push(...commonJsRequireRefs(this.filePath, this.source, this.language));
 
+      if (this.language === 'cpp') {
+        appendUnrealReflection({ nodes: this.nodes, edges: this.edges, unresolvedReferences: this.unresolvedReferences,
+          errors: this.errors, durationMs: 0 }, this.filePath, this.originalSource,
+        text => this.extractor?.preParse?.(text, this.filePath) ?? text, this.tree.rootNode);
+      }
+
       // hasError is routine for several grammars; warn only when no symbols survived.
       // (A re-export's import of its module is none: a barrel whose other lines
       // failed to parse has lost what it passes on.)
@@ -904,6 +913,7 @@ export class TreeSitterExtractor {
       }
       // Release source string to reduce GC pressure
       this.source = '';
+      this.originalSource = '';
     }
 
     return {
@@ -8784,6 +8794,10 @@ export function extractFromSource(
     const kernelResult = tryKernelExtract(filePath, source, detectedLanguage);
     if (kernelResult) {
       result = kernelResult;
+      if (detectedLanguage === 'cpp') {
+        const preParse = EXTRACTORS.cpp?.preParse;
+        appendUnrealReflection(result, filePath, source, text => preParse ? preParse(text, filePath) : text);
+      }
     } else {
       // A kernel-deferred file already paid the (offset-preserving) preParse
       // at the route point — reuse those bytes instead of blanking again.
@@ -8792,7 +8806,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        { sourceIsPreParsed: deferredPre != null }
+        { sourceIsPreParsed: deferredPre != null, originalSource: source }
       );
       result = extractor.extract();
     }

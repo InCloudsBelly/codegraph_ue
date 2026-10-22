@@ -144,6 +144,8 @@ export interface ResolutionContext {
   getProjectRoot(): string;
   /** Get all files */
   getAllFiles(): string[];
+  /** Indexed language, including project-specific extension mappings. */
+  getFileLanguage?(filePath: string): Language | null;
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
   /**
@@ -260,6 +262,8 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  getUeModuleRules?(): readonly import('./ue-module-environment').UeModuleObservation[];
+  resolveCppInclude?(fromFile: string, spec: string, quote?: import('./cpp-include-environment').CppIncludeQuote, line?: number): import('./cpp-include-environment').CppIncludeResolution;
   /**
    * The import node of every C / C++ `#include`, narrowed to the path it
    * spells and where it is written: what ./cpp-includers builds the include

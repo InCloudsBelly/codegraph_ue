@@ -509,6 +509,8 @@ export async function cFnPointerDispatchEdges(
   // project root. Returns a project-root-relative path that exists on disk
   // (even if it was never indexed — e.g. redis' generated `commands.def`).
   const resolveInclude = (includer: string, inc: string): string | null => {
+    const scoped = ctx.resolveCppInclude?.(includer, inc, '"');
+    if (scoped && scoped.status !== 'no-environment') return scoped.status === 'resolved' ? scoped.file : null;
     const dir = path.posix.dirname(includer.replace(/\\/g, '/'));
     const cand = path.posix.normalize(path.posix.join(dir, inc));
     if (ctx.fileExists(cand)) return cand;

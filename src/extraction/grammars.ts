@@ -11,6 +11,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { ExtractionError, Language } from '../types';
+import { hasUnrealCppDeclaration } from './languages/unreal-macros';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -763,6 +764,7 @@ function looksLikeCpp(source: string): boolean {
   if (/\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample)) {
     return true;
   }
+  if (hasUnrealCppDeclaration(source)) return true;
   // Plain `struct Derived : Base` (no export macro, no `class` keyword, no
   // explicit access section) — the #1159 branch above only recognizes the
   // macro-annotated form. Scanned over the whole file, not the sample, with

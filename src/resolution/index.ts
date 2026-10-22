@@ -32,6 +32,7 @@ import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
+import { CppIncludeEnvironment } from './cpp-include-environment';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -309,6 +310,8 @@ export class ReferenceResolver {
   private nodesByKindCache = new Map<Node['kind'], Node[]>();
   // Filesystem existence probes behind context.fileExists (paths not in knownFiles).
   private fileExistsMemo = new Map<string, boolean>();
+  private cppIncludeEnvironment?: CppIncludeEnvironment;
+  private fileLanguages?: Map<string, Language>;
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -564,6 +567,8 @@ export class ReferenceResolver {
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
+    this.cppIncludeEnvironment = undefined;
+    this.fileLanguages = undefined;
     this.manifestScopes.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
@@ -678,6 +683,22 @@ export class ReferenceResolver {
   /**
    * Create the resolution context
    */
+  async refreshUeModuleGraph(): Promise<number> {
+    const { refreshUnrealModuleGraph } = await import('./ue-module-graph');
+    return refreshUnrealModuleGraph(this.queries, this.context, createYielder());
+  }
+
+  getCppIncludeAffectedFiles(files: readonly string[]): string[] {
+    this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
+    return this.cppIncludeEnvironment.affectedFiles(files);
+  }
+
+  getCppIncludeSnapshot(previous?: string | null): import('./cpp-include-environment').CppIncludeSnapshot {
+    this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
+    try { if (JSON.parse(previous ?? 'null')?.ueModules === true) this.cppIncludeEnvironment.getUeModuleRules(); } catch { /* Earlier snapshots have no UE module observations. */ }
+    return this.cppIncludeEnvironment.snapshot(previous);
+  }
+
   private createContext(): ResolutionContext {
     return {
       // A C or C++ `#include` the import resolver can't place is linked by the
@@ -686,7 +707,8 @@ export class ReferenceResolver {
       // cppIncluders reads includes through this, so it sees the include edges
       // a reader sees. A standard header is never the project's: `<math.h>`
       // is not jemalloc's test/math.h, which only its includers may see.
-      resolveImport: (ref) => resolveViaImport(ref, this.context) ??
+      resolveImport: (ref) => (ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports' &&
+        this.context.resolveCppInclude?.(ref.filePath, ref.referenceName, 'unknown', ref.line).status !== 'no-environment' ? resolveViaImport(ref, this.context) : resolveViaImport(ref, this.context) ??
         ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports' &&
           !isExternalImport(ref.referenceName, ref.language, this.context) ? matchByFilePath(ref, this.context) : null),
       // A path alias makes an import the project's only when it maps the
@@ -875,6 +897,10 @@ export class ReferenceResolver {
       getAllFiles: () => {
         return this.queries.getAllFilePaths();
       },
+      getFileLanguage: (filePath) => {
+        this.fileLanguages ??= new Map(this.queries.getFileLanguages().map(file => [file.path, file.language]));
+        return this.fileLanguages.get(filePath) ?? null;
+      },
 
       listDirectories: (relativePath: string) => {
         const target = relativePath === '.' || relativePath === ''
@@ -1053,6 +1079,14 @@ export class ReferenceResolver {
       },
 
       getCppIncludeNodes: () => this.queries.getCppIncludeNodes(),
+      getUeModuleRules: () => {
+        this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
+        return this.cppIncludeEnvironment.getUeModuleRules();
+      },
+      resolveCppInclude: (file, spec, quote, line) => {
+        this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
+        return this.cppIncludeEnvironment.resolve(file, spec, quote, line);
+      },
     };
   }
 
@@ -1394,6 +1428,10 @@ export class ReferenceResolver {
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports' &&
+      this.context.resolveCppInclude?.(ref.filePath, ref.referenceName, 'unknown', ref.line).status !== 'no-environment') {
+      return resolveViaImport(ref, this.context);
+    }
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);

@@ -28,6 +28,9 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
+import { unrealDelegateEdges } from './ue-delegate-synthesizer';
+import { unrealDeclarationEdges } from './ue-declaration-synthesizer';
+import { unrealModuleEdges } from './ue-module-graph';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
@@ -5035,7 +5038,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // header or markup edit can change a channel whose endpoints live elsewhere.
   if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
-    /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
+    /\b(?:struct|union|typedef|virtual|override|UPROPERTY|UFUNCTION|DECLARE_[A-Z_]\w*|AddUObject|BindUObject|Broadcast|Execute|ExecuteIfBound)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
@@ -5093,6 +5096,9 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
   { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
   { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, c, y) => cppOverrideEdges(q, c, y) },
+  { name: 'unrealDeclarations', gate: (has) => has('cpp'), run: (_q, c, y) => unrealDeclarationEdges(c, y) },
+  { name: 'unrealDelegates', gate: (has) => has('cpp'), run: (_q, c, y) => unrealDelegateEdges(c, y) },
+  { name: 'unrealModules', gate: (has) => has('csharp'), run: (_q, c, y) => unrealModuleEdges(c, y) },
   {
     name: 'ifaceEdges',
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),

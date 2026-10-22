@@ -2224,6 +2224,21 @@ export class QueryBuilder {
     this.stmts.deleteEdgesBySource.run(sourceId);
   }
 
+  /** Delete one synthesis owner's edges from bounded source nodes only. */
+  deleteSynthesizedEdgesByOwner(owner: string, sourceIds: readonly string[]): number {
+    let changed = 0;
+    this.db.transaction(() => {
+      for (let i = 0; i < sourceIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = sourceIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        changed += this.db.prepare(`DELETE FROM edges
+          WHERE source IN (${chunk.map(() => '?').join(',')})
+            AND CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END = ?`)
+          .run(...chunk, owner).changes;
+      }
+    })();
+    return changed;
+  }
+
   /**
    * Get outgoing edges from a node. Preserve the source/kind index order
    * (calls before imports/references), then break ties deterministically.
@@ -4788,6 +4803,24 @@ export class QueryBuilder {
    * all of them, or only those naming one of `segments` as a dotted part
    * (`x`, `a.x`, `x.b`, `.x`).
    */
+  hasCppFiles(): boolean {
+    return !!this.db.prepare("SELECT 1 FROM files WHERE language IN ('c', 'cpp') LIMIT 1").get();
+  }
+
+  /** File identity and indexed language only; no source or node decoding. */
+  getFileLanguages(): Array<{ path: string; language: Language }> {
+    return this.db.prepare('SELECT path, language FROM files').all() as Array<{ path: string; language: Language }>;
+  }
+
+  requeueFailedReferencesFromFiles(language: Language, files: string[]): number {
+    let changed = 0;
+    for (let i = 0; i < files.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = files.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      changed += this.db.prepare(`UPDATE unresolved_refs SET status = 'pending' WHERE status = 'failed' AND language = ? AND file_path IN (${chunk.map(() => '?').join(',')})`).run(language, ...chunk).changes;
+    }
+    return changed;
+  }
+
   requeueFailedReferencesByLanguage(language: Language, segments?: string[], files?: Set<string>): number {
     const sql = "UPDATE unresolved_refs SET status = 'pending' WHERE status = 'failed' AND language = ?";
     if (!segments) return this.db.prepare(sql).run(language).changes;

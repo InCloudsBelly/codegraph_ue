@@ -5,19 +5,21 @@ import { collectBeforeExit } from '../worker-teardown';
 if (parentPort) {
   const port = parentPort;
   let cg: import('../index').default | null = null;
-  let counts: { added: number; modified: number; removed: number } | null = null;
+  let counts: unknown = null;
   try {
     const CodeGraph = (require('../index') as typeof import('../index')).default;
     // Loaded: from here on the owner may terminate this worker. Ending it while
     // it loads those modules can crash the process on Windows (worker-teardown.ts).
     port.postMessage({ type: 'loaded' });
-    cg = CodeGraph.openSync((workerData as { root: string }).root);
-    const changes = cg.getChangedFiles();
-    counts = {
-      added: changes.added.length,
-      modified: changes.modified.length,
-      removed: changes.removed.length,
-    };
+    const metadataOnly = (workerData as { mode?: string }).mode === 'cpp-includes';
+    cg = CodeGraph.openSync((workerData as { root: string }).root, metadataOnly ? { readOnly: true } : {});
+    if (metadataOnly) {
+      const status = cg.getCppIncludeEnvironmentStatus();
+      counts = { observed: status.observed, complete: status.complete, changed: status.changed, reason: status.reason };
+    } else {
+      const changes = cg.getChangedFiles();
+      counts = { added: changes.added.length, modified: changes.modified.length, removed: changes.removed.length };
+    }
   } catch {
     // A failed or timed-out measurement must never masquerade as zero changes.
   } finally {

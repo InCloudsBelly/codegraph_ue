@@ -73,6 +73,8 @@ calls; a grep/read exploration is dozens.
 
 ## Limitations
 
+- In this Unreal fork, reflection annotations are indexed as declarations, not UHT output. Explicit native delegate bindings may add heuristic flow hops with their registration sites; dynamic names, lambdas and uncertain receiver aliases are not inferred. A missing hop does not prove a callback cannot run. An unobserved or incomplete C++ include environment cannot certify a fresh graph, even when a file watcher is healthy.
+
 - If a tool reports a project isn't indexed (no \`.codegraph/\`), stop calling codegraph tools for that project for the rest of the session and use your built-in tools there instead. Indexing is the user's decision — mention they can run \`codegraph init\` if it comes up, but don't run it yourself.
 - Index lags file writes by ~1 second.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.

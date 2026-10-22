@@ -14,6 +14,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- C++ include 按编译单元区分搜索环境，并在响应文件或头文件搜索拓扑变化后重新核对依赖。
+- Unreal 反射字段、函数声明和委托类型可以检索，明确的原生委托绑定可连接触发函数、回调和下游调用。
+- Unreal 构建规则中的模块依赖及插件归属可以查询，元数据变化后可单独同步这些关系。
+- `status --metadata-only --json` 提供维护前的轻量元数据观察，严格状态检查仍负责确认工作树同步。
 - 默认解析 `.inl` 内的 C++ 实现，插件及引擎内联代码可参与查询、调用关系和增量同步。
 - Unreal 查询补充类型前缀和源码文件基名候选，优先展示明确目标及相关关系。
 - 支持个人 include/exclude 配置，将被忽略或通过项目内链接接入的插件源码纳入索引、同步和监听。
@@ -22,6 +26,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- 大型工作区的普通 Git 忽略目录使用更快的路径查找，保留特殊模式和否定规则的既有语义。
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
 - In React, a component rendered at module scope, in a top-level constant or inside a test's `it(…)` callback, like `createRoot(el).render(<App />)` or `render(<Card />)`, now counts as rendered there, so an app's entry reaches its root component and a component's tests show among its callers. (#2587)
 - In Python, `import a.b as X` written inside a function now links its calls like `X.f()`, as the same import at module level already did. Thanks @Egrn for the report. (#2600)

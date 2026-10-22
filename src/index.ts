@@ -46,7 +46,7 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
-import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
+import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage, loadGrammarsForLanguages } from './extraction/grammars';
 import {
   ReferenceResolver,
   changedRoutes,
@@ -69,6 +69,7 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { CPP_INCLUDE_SNAPSHOT_KEY, checkCppIncludeSnapshot } from './resolution/cpp-include-environment';
 
 // Re-export types for consumers
 export * from './types';
@@ -627,6 +628,9 @@ export class CodeGraph {
         // chance to see the actual project before resolution runs.
         if (result.success && result.filesIndexed > 0) {
           const tReinit = Date.now();
+          if (this.queries.getAllFilePaths().some(f => /\.Build\.cs$/i.test(f))) {
+            await initGrammars(); await loadGrammarsForLanguages(['csharp']);
+          }
           this.resolver.initialize();
           // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
           // before resolution so updated names show up in subsequent reads.
@@ -740,7 +744,10 @@ export class CodeGraph {
         // engine produces richer extraction than the one on disk. Only on a
         // real full index — a sync touches a subset, so it must NOT advance the
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
-        if (result.success) this.stampPythonRootFingerprint();
+        if (result.success) {
+          this.stampPythonRootFingerprint();
+          this.stampCppIncludeSnapshot();
+        }
 
         if (result.success && result.filesIndexed > 0) {
           try {
@@ -851,6 +858,21 @@ export class CodeGraph {
     } catch { /* metadata is advisory */ }
   }
 
+  hasCppIncludeFiles(): boolean { return this.queries.hasCppFiles() || this.queries.getMetadata('ue_module_metadata_observed') === '1'; }
+
+  getCppIncludeEnvironmentStatus(): ReturnType<typeof checkCppIncludeSnapshot> {
+    if (!this.hasCppIncludeFiles()) {
+      return { observed: true, complete: true, changed: false, affectedFiles: [] };
+    }
+    return checkCppIncludeSnapshot(this.projectRoot, this.queries.getMetadata(CPP_INCLUDE_SNAPSHOT_KEY));
+  }
+
+  private stampCppIncludeSnapshot(): void {
+    const snapshot = this.resolver.getCppIncludeSnapshot(this.queries.getMetadata(CPP_INCLUDE_SNAPSHOT_KEY));
+    this.queries.setMetadata(CPP_INCLUDE_SNAPSHOT_KEY, JSON.stringify(snapshot));
+    this.queries.setMetadata('ue_module_metadata_observed', snapshot.ueModules ? '1' : '0');
+  }
+
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
       const startedAt = Date.now();
@@ -937,6 +959,13 @@ export class CodeGraph {
         const fullReconcile = !options.paths || options.paths.length === 0;
         const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
 
+        if (this.hasCppIncludeFiles() && this.queries.getAllFilePaths().some(f => /\.Build\.cs$/i.test(f))) {
+          await initGrammars();
+          await loadGrammarsForLanguages(['csharp']);
+        }
+        const cppEnvironmentBefore = this.getCppIncludeEnvironmentStatus();
+        const forceCppContentCheck = cppEnvironmentBefore.physicalRootsChanged ? new Set(cppEnvironmentBefore.affectedFiles) : undefined;
+        if (forceCppContentCheck && options.paths) options = { ...options, paths: [...new Set([...options.paths, ...forceCppContentCheck])] };
         const pythonFilesBefore = this.pythonFilePaths();
         // An interrupted index may have absorbed its changed files before
         // resolution/synthesis. Detect those orphans BEFORE this sync adds refs.
@@ -958,7 +987,7 @@ export class CodeGraph {
               refreshSynthesis = true;
               this.queries.setMetadata('synthesis_pending', '1');
             }
-          });
+          }, forceCppContentCheck);
 
         // A component a tag in an unchanged file may render: `<Team />` links
         // to the `Team` this sync adds. The gate above reads each changed file
@@ -1286,6 +1315,27 @@ export class CodeGraph {
           }
           }
 
+        // Compiler metadata and excluded shadow headers can move answers without a source edit.
+        if (cppEnvironmentBefore.changed) {
+          this.resolver.clearCaches();
+          const cppFiles = new Set(this.queries.getFileLanguages().filter(f => f.language === 'c' || f.language === 'cpp').map(f => f.path));
+          const files = cppEnvironmentBefore.observed ? this.resolver.getCppIncludeAffectedFiles(cppEnvironmentBefore.affectedFiles) :
+            [...cppFiles];
+          this.orchestrator.resurrectResolutionEdgesFromFiles('cpp', files);
+          this.orchestrator.resurrectResolutionEdgesFromFiles('c', files);
+          this.resolver.resolveAndPersist(this.queries.getUnresolvedReferencesByFiles(files));
+          if (files.some(f => cppFiles.has(f))) {
+            refreshSynthesis = true; this.queries.setMetadata('synthesis_pending', '1');
+          }
+        }
+        const moduleMetadataChanged = cppEnvironmentBefore.changed && (cppEnvironmentBefore.affectedFiles.some(f => /\.Build\.cs$/i.test(f)) ||
+          cppEnvironmentBefore.affectedFiles.length === 0 && this.queries.getMetadata('ue_module_metadata_observed') === '1');
+        if (moduleMetadataChanged || [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])].some(f => /\.Build\.cs$/i.test(f))) {
+          this.resolver.clearCaches();
+          await initGrammars(); await loadGrammarsForLanguages(['csharp']);
+          await this.resolver.refreshUeModuleGraph();
+        }
+
         // Python module answers this sync may have moved in files it never
         // touched. If the root set changed (a top-level package appeared, a
         // build config was edited) any import anywhere may bind differently:
@@ -1454,6 +1504,7 @@ export class CodeGraph {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
 
+        this.stampCppIncludeSnapshot();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;

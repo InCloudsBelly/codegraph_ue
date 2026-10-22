@@ -1092,7 +1092,8 @@ program
   .command('status [path]')
   .description('Show index status and statistics')
   .option('-j, --json', 'Output as JSON')
-  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+  .option('--metadata-only', 'Read index metadata without checking the working tree')
+  .action(async (pathArg: string | undefined, options: { json?: boolean; metadataOnly?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
     const indexingConfig = getIndexingConfigStatus(projectPath);
     // The directory the user actually ran from, before walking up to the index
@@ -1111,6 +1112,7 @@ program
             indexPath: getCodeGraphDir(projectPath),
             indexingConfig,
             lastIndexed: null,
+            ...(options.metadataOnly ? { pendingChanges: null, workingTreeChecked: false, freshness: 'unknown', cppIncludeEnvironment: null } : {}),
           }));
           return;
         }
@@ -1122,10 +1124,10 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, options.metadataOnly ? { readOnly: true, sync: false } : {});
       const stats = cg.getStats();
       // Invalid scope configuration must remain diagnosable without scanning it.
-      const changes = indexingConfig.error ? null : cg.getChangedFiles();
+      const changes = options.metadataOnly || indexingConfig.error ? null : cg.getChangedFiles();
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
 
@@ -1137,7 +1139,15 @@ program
       const pendingRefs = cg.getPendingReferenceCount();
       // Files whose content is current but whose symbols are missing — the
       // content-hash check behind "up to date" cannot see them (#2336).
-      const health = cg.getIndexHealth();
+      const health = options.metadataOnly ? null : cg.getIndexHealth();
+      const cppEnvironmentStatus = options.metadataOnly ? null : cg.getCppIncludeEnvironmentStatus();
+      const cppIncludeEnvironment = cppEnvironmentStatus ? {
+        observed: cppEnvironmentStatus.observed,
+        complete: cppEnvironmentStatus.complete,
+        changed: cppEnvironmentStatus.changed,
+        affectedFileCount: cppEnvironmentStatus.affectedFiles.length,
+        ...(cppEnvironmentStatus.reason ? { reason: cppEnvironmentStatus.reason } : {}),
+      } : null;
 
       // JSON output mode
       if (options.json) {
@@ -1148,6 +1158,8 @@ program
           projectPath,
           indexPath: getCodeGraphDir(projectPath),
           indexingConfig,
+          ...(options.metadataOnly ? { workingTreeChecked: false, freshness: 'unknown' } : {}),
+          cppIncludeEnvironment,
           lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
@@ -1181,10 +1193,10 @@ program
             pendingRefs,
             // Files stored without their symbols (e.g. while their grammar
             // could not load, #2335); the next sync re-indexes them.
-            filesNeedingReindex: health.needsReindex.length,
+            filesNeedingReindex: health?.needsReindex.length ?? null,
             // Files with a recorded parse error and no symbols from it
             // (#2336); unchanged until the file or the parser changes.
-            filesWithParseErrors: health.parseErrors.length,
+            filesWithParseErrors: health?.parseErrors.length ?? null,
           },
         }));
         cg.destroy();
@@ -1225,7 +1237,7 @@ program
         const oversized = stats.walSizeBytes > Math.max(WAL_HEAL_THRESHOLD_BYTES, stats.dbSizeBytes);
         const walLabel = `${(stats.walSizeBytes / 1024 / 1024).toFixed(2)} MB`;
         console.log(`  WAL Size:  ${oversized ? chalk.yellow(walLabel) : walLabel}`);
-        if (oversized) {
+        if (oversized && !options.metadataOnly) {
           warn('The write-ahead log is larger than the database — killed sessions left it behind. It is reclaimed automatically on open; if it persists across runs, another live CodeGraph process is holding it.');
         }
       }
@@ -1265,6 +1277,7 @@ program
 
       // Pending changes
       if (indexingConfig.error) warn(indexingConfig.error);
+      if (options.metadataOnly) info('Working tree was not checked; run "codegraph status" for a strict status.');
       const totalChanges = changes ? changes.added.length + changes.modified.length + changes.removed.length : null;
       if (changes && totalChanges !== null && totalChanges > 0) {
         console.log(chalk.bold('Pending Changes:'));
@@ -1279,9 +1292,11 @@ program
         }
         info('Run "codegraph sync" to update the index');
       }
-      const missingSymbols = describeFilesMissingSymbols(health);
+      const missingSymbols = health ? describeFilesMissingSymbols(health) : [];
       for (const line of missingSymbols) warn(line);
-      if (totalChanges === 0 && missingSymbols.length === 0) {
+      const cppEnvironmentVerified = cppIncludeEnvironment?.observed && cppIncludeEnvironment.complete && !cppIncludeEnvironment.changed;
+      if (cppIncludeEnvironment && !cppEnvironmentVerified) warn('C/C++ include dependencies are not fully verified; the index cannot be reported up to date.');
+      if (totalChanges === 0 && missingSymbols.length === 0 && cppEnvironmentVerified) {
         success('Index is up to date');
       }
       console.log();

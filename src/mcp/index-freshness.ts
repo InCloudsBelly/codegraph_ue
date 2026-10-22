@@ -13,6 +13,19 @@ export interface PendingChangeCounts {
 const MEASURE_TIMEOUT_MS = 8_000;
 let liveMeasurements = 0;
 const active = new Map<string, Promise<PendingChangeCounts | null>>();
+export interface CppIncludeFreshness { observed: boolean; complete: boolean; changed: boolean; reason?: string }
+const includeActive = new Map<string, Promise<CppIncludeFreshness | null>>();
+export function measureCppIncludeEnvironment(root: string, timeoutMs = MEASURE_TIMEOUT_MS): Promise<CppIncludeFreshness | null> {
+  const key = path.resolve(root);
+  const existing = includeActive.get(key);
+  if (existing) return existing;
+  if (liveMeasurements >= 2) return Promise.resolve(null);
+  const pending = runMeasurement<CppIncludeFreshness>(key, timeoutMs, 'cpp-includes', value => {
+    if (!value || typeof value !== 'object' || !['observed', 'complete', 'changed'].every(k => typeof (value as Record<string, unknown>)[k] === 'boolean')) return null;
+    return value as CppIncludeFreshness;
+  }).finally(() => includeActive.delete(key));
+  includeActive.set(key, pending); return pending;
+}
 /** Every measurement worker not yet terminated, with its load — for {@link endFreshnessMeasurements}. */
 const live = new Map<Worker, Promise<void>>();
 
@@ -23,7 +36,11 @@ export function measurePendingChanges(root: string, timeoutMs = MEASURE_TIMEOUT_
   // Status probes for many projects must not exhaust the shared daemon.
   if (liveMeasurements >= 2) return Promise.resolve(null);
 
-  const pending = runMeasurement(key, timeoutMs).finally(() => active.delete(key));
+  const pending = runMeasurement<PendingChangeCounts>(key, timeoutMs, 'changes', value => {
+    if (!value || typeof value !== 'object') return null;
+    const counts = value as PendingChangeCounts;
+    return ['added', 'modified', 'removed'].every(k => Number.isSafeInteger(counts[k as keyof PendingChangeCounts]) && counts[k as keyof PendingChangeCounts] >= 0) ? counts : null;
+  }).finally(() => active.delete(key));
   active.set(key, pending);
   return pending;
 }
@@ -37,7 +54,7 @@ export async function endFreshnessMeasurements(): Promise<void> {
   await Promise.all([...live].map(([worker, loaded]) => terminateOnceStarted(worker, loaded)));
 }
 
-function runMeasurement(root: string, timeoutMs: number): Promise<PendingChangeCounts | null> {
+function runMeasurement<T>(root: string, timeoutMs: number, mode: 'changes' | 'cpp-includes', validate: (value: unknown) => T | null): Promise<T | null> {
   // The compiled sibling is beside us in production; Vitest loads src/ but
   // builds dist/ before the tests, so use that copy for the worker there.
   const sibling = path.join(__dirname, 'index-freshness-worker.js');
@@ -48,7 +65,7 @@ function runMeasurement(root: string, timeoutMs: number): Promise<PendingChangeC
 
   let worker: Worker;
   try {
-    worker = new Worker(workerFile, { workerData: { root } });
+    worker = new Worker(workerFile, { workerData: { root, mode } });
   } catch {
     return Promise.resolve(null);
   }
@@ -60,7 +77,7 @@ function runMeasurement(root: string, timeoutMs: number): Promise<PendingChangeC
   liveMeasurements++;
   return new Promise(resolve => {
     let settled = false;
-    const finish = (counts: PendingChangeCounts | null) => {
+    const finish = (counts: T | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -74,13 +91,9 @@ function runMeasurement(root: string, timeoutMs: number): Promise<PendingChangeC
       resolve(counts);
     };
     const timer = setTimeout(() => finish(null), timeoutMs);
-    worker.on('message', (msg: { type?: string; counts?: PendingChangeCounts | null }) => {
+    worker.on('message', (msg: { type?: string; counts?: unknown }) => {
       if (msg?.type !== 'counts') return;
-      const value = msg.counts;
-      const valid = value && typeof value === 'object' && ['added', 'modified', 'removed'].every(
-        key => Number.isSafeInteger(value[key as keyof PendingChangeCounts]) && value[key as keyof PendingChangeCounts] >= 0,
-      );
-      finish(valid ? value : null);
+      finish(validate(msg.counts));
     });
     worker.once('error', () => finish(null));
     worker.once('exit', () => finish(null));
