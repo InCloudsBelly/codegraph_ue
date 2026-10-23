@@ -1209,10 +1209,20 @@ export async function cFnPointerDispatchEdges(
   if (prof) { prof.C = Date.now() - tPass; tPass = Date.now(); }
 
   // ---- receiver-type resolution within a function's source ----
+  // Type/layout tables are stable after Stage C. Each function in D/E owns
+  // separate exact-argument caches, including null, discarded with its body.
+  const makeTypeMemo = () => ({
+    recv: new Map<string, string | null>(),
+    variable: new Map<string, string | null>(),
+    chain: new Map<string, string | null>(),
+  });
+  type TypeMemo = ReturnType<typeof makeTypeMemo>;
   // `(?:struct )?TYPE [*]recv` declared in the params or body → TYPE (if a known
   //  fn-pointer-bearing struct).
   const recvReCache = new LRUCache<string, RegExp>(4096);
-  const recvTypeIn = (fnSrc: string, recv: string): string | null => {
+  const recvTypeIn = (fnSrc: string, recv: string, memo: TypeMemo): string | null => {
+    const cached = memo.recv.get(recv);
+    if (cached !== undefined) return cached;
     let re = recvReCache.get(recv);
     if (!re) {
       re = new RegExp(`(?:(?:struct|union)\\s+)?(\\w+)\\s*\\*?\\s*\\b${recv}\\b\\s*(?:[,)=;]|\\[)`, 'g');
@@ -1221,8 +1231,9 @@ export async function cFnPointerDispatchEdges(
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fnSrc))) {
-      if (structLayout.has(m[1]!)) return m[1]!;
+      if (structLayout.has(m[1]!)) { memo.recv.set(recv, m[1]!); return m[1]!; }
     }
+    memo.recv.set(recv, null);
     return null;
   };
 
@@ -1231,7 +1242,9 @@ export async function cFnPointerDispatchEdges(
   // Falls back to a file-scope table variable (`cmdnames` in `cmdnames[i].fn()`).
   const escapeRe = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const varReCache = new LRUCache<string, RegExp>(4096);
-  const varTypeIn = (fnSrc: string, v: string): string | null => {
+  const varTypeIn = (fnSrc: string, v: string, memo: TypeMemo): string | null => {
+    const cached = memo.variable.get(v);
+    if (cached !== undefined) return cached;
     let re = varReCache.get(v);
     if (!re) {
       re = new RegExp(`(?:(?:struct|union)\\s+)?(\\w+)\\s*\\*?\\s*\\b${escapeRe(v)}\\b\\s*(?:[,)=;]|\\[)`, 'g');
@@ -1240,19 +1253,23 @@ export async function cFnPointerDispatchEdges(
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fnSrc))) {
-      if (!C_TYPE_KEYWORDS.has(m[1]!)) return m[1]!;
+      if (!C_TYPE_KEYWORDS.has(m[1]!)) { memo.variable.set(v, m[1]!); return m[1]!; }
     }
-    return globalVarType.get(v) ?? null;
+    const type = globalVarType.get(v) ?? null;
+    memo.variable.set(v, type);
+    return type;
   };
 
   // Resolve a member-access chain (`c->cmd`, or just `p`) to a struct type,
   // walking each segment's declared field type. `c->cmd->proc` dispatch:
   // base chain `c->cmd` → client.cmd's type `redisCommand`, the proc owner.
   // Array subscripts (`cmdnames[i]`) are stripped — an index yields one element.
-  const resolveChainType = (fnSrc: string, chain: string): string | null => {
+  const resolveChainType = (fnSrc: string, chain: string, memo: TypeMemo): string | null => {
+    const cached = memo.chain.get(chain);
+    if (cached !== undefined) return cached;
     const segs = chain.replace(/\s*\[[^\]]*\]/g, '').split(/\s*(?:->|\.)\s*/).filter(Boolean);
-    if (segs.length === 0) return null;
-    let t = varTypeIn(fnSrc, segs[0]!);
+    if (segs.length === 0) { memo.chain.set(chain, null); return null; }
+    let t = varTypeIn(fnSrc, segs[0]!, memo);
     for (let i = 1; t && i < segs.length; i++) {
       let next: string | null = null;
       for (const fields of allStructFields.get(t) ?? []) {
@@ -1261,6 +1278,7 @@ export async function cFnPointerDispatchEdges(
       }
       t = next;
     }
+    memo.chain.set(chain, t);
     return t;
   };
 
@@ -1290,6 +1308,7 @@ export async function cFnPointerDispatchEdges(
       if (!FN_KINDS.has(fn.kind)) continue;
       const body = sliceLinesPre(dLines, fn.startLine, fn.endLine);
       if (!body.includes('=')) continue;
+      let typeMemo: TypeMemo | undefined;
       FIELD_ASSIGN_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = FIELD_ASSIGN_RE.exec(body))) {
@@ -1299,8 +1318,9 @@ export async function cFnPointerDispatchEdges(
         // that are fn-pointer fields of SOME struct can pass fnPtrFieldOf —
         // skip the two regex type resolutions for the ~99% that can't.
         if (!fieldToStructs.has(lfield!) || !fieldToStructs.has(rfield!)) continue;
-        const lt = recvTypeIn(body, lrecv!);
-        const rt = recvTypeIn(body, rrecv!);
+        const memo = typeMemo ??= makeTypeMemo();
+        const lt = recvTypeIn(body, lrecv!, memo);
+        const rt = recvTypeIn(body, rrecv!, memo);
         if (lt && rt && fnPtrFieldOf(lt, lfield!) && fnPtrFieldOf(rt, rfield!)) {
           propagations.push({ to: `${lt}.${lfield}`, from: `${rt}.${rfield}` });
         }
@@ -1350,6 +1370,7 @@ export async function cFnPointerDispatchEdges(
     for (const fn of fnsE) {
     if (!FN_KINDS.has(fn.kind)) continue;
     const body = sliceLinesPre(eLines, fn.startLine, fn.endLine);
+    let typeMemo: TypeMemo | undefined;
     DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     let added = 0;
@@ -1371,10 +1392,11 @@ export async function cFnPointerDispatchEdges(
       // 1) resolve the receiver chain's struct type precisely (handles c->cmd->proc);
       // 2) else the last segment as a simple local/param of a fn-pointer-bearing struct;
       // 3) else fall back to a field name that belongs to exactly one struct.
-      let struct = resolveChainType(body, baseChain);
+      const memo = typeMemo ??= makeTypeMemo();
+      let struct = resolveChainType(body, baseChain, memo);
       if (!struct || !owners.has(struct)) {
         const lastSeg = baseChain.replace(/\s*\[[^\]]*\]/g, '').split(/\s*(?:->|\.)\s*/).pop()!;
-        const t = recvTypeIn(body, lastSeg);
+        const t = recvTypeIn(body, lastSeg, memo);
         struct = t && owners.has(t) ? t : null;
       }
       if (!struct || !owners.has(struct)) struct = owners.size === 1 ? [...owners][0]! : null;
