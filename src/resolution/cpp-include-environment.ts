@@ -156,6 +156,12 @@ export class CppIncludeEnvironment {
   private derivedComplete = true;
   private modules?: UeModuleRules[];
   private readonly moduleObservations: UeModuleObservation[] = [];
+  private readonly moduleNames = new Map<string, UeModuleRules[]>();
+  private readonly moduleDirectories = new Map<string, UeModuleObservation>();
+  private readonly moduleByRules = new Map<UeModuleRules, UeModuleObservation>();
+  private readonly moduleScopes = new Map<UeModuleRules, Map<boolean, Environment[]>>();
+  private readonly moduleFiles = new Map<string, Environment[] | undefined>();
+  private readonly moduleMetadataKeys = new Set<string>();
   constructor(private readonly context: ResolutionContext) {
     this.root = context.getProjectRoot();
     this.physicalRoot = fs.realpathSync.native(this.root);
@@ -266,10 +272,23 @@ export class CppIncludeEnvironment {
       return cached!;
     }
     let value: Buffer | null = null;
+    let failureIdentity: string | undefined;
+    let canonical: string | undefined;
     try {
-      if (fs.statSync(absolute).size <= 256 * 1024 * 1024 && this.logical(fs.realpathSync.native(absolute)) !== null) value = fs.readFileSync(absolute);
-      else this.complete = false;
-    } catch { /* Missing compiler metadata is recorded as a negative dependency. */ }
+      if (fs.statSync(absolute).size > 256 * 1024 * 1024) {
+        this.complete = false; failureIdentity = 'unsupported';
+      } else {
+        canonical = fs.realpathSync.native(absolute);
+        if (this.logical(canonical) !== null) value = fs.readFileSync(absolute);
+        else { this.complete = false; failureIdentity = 'refused'; }
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        this.complete = false;
+        failureIdentity = `unreadable:${code ?? 'unknown'}`;
+      }
+    }
     // Retain at most 32 MiB of raw metadata; environments retain paths and digests only.
     if (value === null || value.length <= 32 * 1024 * 1024) {
       this.metadata.set(logical, value); this.metadataBytes += value?.length ?? 0;
@@ -280,8 +299,9 @@ export class CppIncludeEnvironment {
     }
     const key = `content:${logical}`;
     if (!this.dependencies.has(key) && this.dependencies.size < MAX_DEPENDENCIES && this.ownerCount < 500_000) {
-      let fingerprint = 'missing';
-      try { if (value) fingerprint = `${fs.realpathSync.native(absolute)}\0${digest(value)}`; } catch { /* The next sync observes a disappearing input. */ }
+      // Keep the authorized bytes' identity even if the path disappears after
+      // the read; a later snapshot check must see drift, not trusted absence.
+      const fingerprint = value && canonical ? `${canonical}\0${digest(value)}` : failureIdentity ?? 'missing';
       this.dependencies.set(key, { path: logical, kind: 'content', identity: fingerprint, owners: [owner] });
       this.dependencyOwners.set(key, new Set([owner]));
       this.ownerCount++;
@@ -295,6 +315,14 @@ export class CppIncludeEnvironment {
       return language === 'c' || language === 'cpp';
     }), ...this.moduleObservations.filter(o => o.rules.isModuleRules).map(o => o.filePath)])];
     const indexed = new Set(files);
+    const cppFiles = new Set(files.filter(file => this.isCppFile(file)));
+    const cppDirectories = new Set<string>();
+    for (const file of cppFiles) {
+      for (let directory = path.posix.dirname(file); ; directory = path.posix.dirname(directory)) {
+        cppDirectories.add(directory);
+        if (directory === path.posix.dirname(directory)) break;
+      }
+    }
     if (files.length > 0 && !this.databasePresent && !this.modules?.length) this.complete = false;
     // A synthesis stage may have discarded its include-resolution cache.
     // Static rules that cannot establish public/private search roots remain
@@ -304,12 +332,24 @@ export class CppIncludeEnvironment {
     try {
       const old = JSON.parse(previous ?? 'null') as CppIncludeSnapshot | null;
       if (old?.version === 1 && Array.isArray(old.dependencies) && old.dependencies.length <= MAX_DEPENDENCIES) {
+        // Compaction cannot recover observations truncated by an older batch;
+        // restoring completeness requires a separately verified full replay.
+        if (old.bounded === false) { this.complete = false; this.budgetExceeded = true; }
         let owners = 0;
         for (const dep of old.dependencies) {
           if (!dep || typeof dep.path !== 'string' || !['content', 'probe', 'directory'].includes(dep.kind) || !Array.isArray(dep.owners)) continue;
           owners += dep.owners.length;
           if (owners > 500_000) break;
-          for (const owner of dep.owners) if (typeof owner === 'string' && (owner === '*' || indexed.has(owner))) this.observe(dep.path, dep.kind, owner, dep.identity);
+          for (const owner of dep.owners) {
+            if (typeof owner !== 'string') continue;
+            // Old snapshots named every CPP file. A module scope covers that
+            // same file while retaining far fewer metadata-owner pairs.
+            const module = this.moduleMetadataKeys.has(`${dep.kind}:${dep.path}`) && cppFiles.has(owner)
+              ? this.moduleOwner(owner) : undefined;
+            const compact = module?.rules.isModuleRules ? module.filePath : owner;
+            const retiredModule = /\.Build\.cs$/i.test(compact) && cppDirectories.has(path.posix.dirname(compact));
+            if (compact === '*' || indexed.has(compact) || retiredModule) this.observe(dep.path, dep.kind, compact, dep.identity);
+          }
         }
       }
     } catch { /* Older indexes have no include-environment snapshot. */ }
@@ -375,12 +415,35 @@ export class CppIncludeEnvironment {
   /** Reopen newly reachable headers as well as the previous metadata owners after a TU environment changes. */
   affectedFiles(files: readonly string[]): string[] {
     this.deriveHeaderEnvironments();
-    const affectedEnvironments = new Set(files.flatMap(file => this.byFile.get(file)?.map(env => env.id) ?? []));
     const affected = new Set(files);
+    // The owner may have been removed or renamed; its old directory still
+    // identifies the CPP files whose metadata observations it represented.
+    const moduleDirectories = new Set(files.filter(file => /\.Build\.cs$/i.test(file)).map(file => path.posix.dirname(file)));
+    if (moduleDirectories.size) for (const file of this.context.getAllFiles()) {
+      if (!this.isCppFile(file)) continue;
+      for (let directory = path.posix.dirname(file); ; directory = path.posix.dirname(directory)) {
+        if (moduleDirectories.has(directory)) { affected.add(file); break; }
+        if (directory === path.posix.dirname(directory)) break;
+      }
+    }
+    const affectedEnvironments = new Set([...affected].flatMap(file => this.byFile.get(file)?.map(env => env.id) ?? []));
     for (const [file, environments] of this.derivedEnvironments ?? []) {
       if (environments.some(env => affectedEnvironments.has(env.id))) affected.add(file);
     }
     return [...affected];
+  }
+
+  private isCppFile(file: string): boolean {
+    const language = this.context.getFileLanguage ? this.context.getFileLanguage(file) : this.context.getNodesInFile(file)[0]?.language;
+    return language === 'c' || language === 'cpp';
+  }
+
+  private moduleOwner(file: string): UeModuleObservation | undefined {
+    for (let directory = path.posix.dirname(file); ; directory = path.posix.dirname(directory)) {
+      const owner = this.moduleDirectories.get(directory);
+      if (owner && file.startsWith(owner.rules.directory + '/')) return owner;
+      if (directory === path.posix.dirname(directory)) return undefined;
+    }
   }
 
   getUeModuleRules(): readonly UeModuleObservation[] {
@@ -393,15 +456,22 @@ export class CppIncludeEnvironment {
         try { rule = readUeModuleRules(source, decode(content)); } catch { this.complete = false; continue; }
         const observation: UeModuleObservation = { filePath: source, rules: rule };
         this.moduleObservations.push(observation);
+        this.moduleByRules.set(rule, observation);
+        if (!this.moduleDirectories.has(rule.directory)) this.moduleDirectories.set(rule.directory, observation);
+        const named = this.moduleNames.get(rule.name) ?? [];
+        named.push(rule); this.moduleNames.set(rule.name, named);
+        if (rule.isModuleRules) this.moduleMetadataKeys.add(`content:${source}`);
         const sourceAt = source.lastIndexOf('/Source/');
         if (sourceAt >= 0 && /(?:^|\/)Plugins\//.test(source)) {
           const plugin = source.slice(0, sourceAt);
+          if (rule.isModuleRules) this.moduleMetadataKeys.add(`directory:${plugin}`);
           this.observe(plugin, 'directory', source);
           let descriptors: string[] = [];
           try { descriptors = fs.readdirSync(path.join(this.root, plugin)).filter(f => /\.uplugin$/i.test(f)); } catch { /* Unavailable metadata is incomplete. */ }
           observation.pluginComplete = descriptors.length === 1;
           if (descriptors.length !== 1) rule.publicComplete = rule.privateComplete = false;
           else {
+            if (rule.isModuleRules) this.moduleMetadataKeys.add(`content:${plugin}/${descriptors[0]!}`);
             const data = this.readMetadata(path.join(this.root, plugin, descriptors[0]!), source);
             let descriptor: ReturnType<typeof readUePluginDescriptor> | null = null;
             try { descriptor = data ? readUePluginDescriptor(decode(data)) : null; } catch { /* Invalid encoding is incomplete metadata. */ }
@@ -418,20 +488,25 @@ export class CppIncludeEnvironment {
   }
 
   private moduleEnvironments(file: string): Environment[] | undefined {
+    if (this.moduleFiles.has(file)) return this.moduleFiles.get(file);
     this.getUeModuleRules();
-    const owner = this.modules!.filter(m => file.startsWith(m.directory + '/')).sort((a, b) => b.directory.length - a.directory.length)[0];
-    if (!owner) return undefined;
+    const ownerObservation = this.moduleOwner(file);
+    if (!ownerObservation) { this.moduleFiles.set(file, undefined); return undefined; }
+    const owner = ownerObservation.rules;
+    const isPublic = file.startsWith(owner.directory + '/Public/') || file.startsWith(owner.directory + '/Classes/');
+    let scopes = this.moduleScopes.get(owner);
+    const cached = scopes?.get(isPublic);
+    if (cached) { this.moduleFiles.set(file, cached); return cached; }
     const observeModule = (module: UeModuleRules) => {
-      const entry = this.moduleObservations.find(o => o.rules === module);
+      const entry = this.moduleByRules.get(module);
       if (!entry) return;
-      this.observe(entry.filePath, 'content', file);
+      this.observe(entry.filePath, 'content', ownerObservation.filePath);
       if (entry.plugin) {
-        this.observe(entry.plugin.filePath, 'content', file);
-        this.observe(path.posix.dirname(entry.plugin.filePath), 'directory', file);
+        this.observe(entry.plugin.filePath, 'content', ownerObservation.filePath);
+        this.observe(path.posix.dirname(entry.plugin.filePath), 'directory', ownerObservation.filePath);
       }
     };
     observeModule(owner);
-    const isPublic = file.startsWith(owner.directory + '/Public/') || file.startsWith(owner.directory + '/Classes/');
     let complete = owner.publicComplete && (isPublic || owner.privateComplete);
     const directories = [owner.directory + '/Public', owner.directory + '/Classes', ...owner.publicIncludePaths];
     if (!isPublic) directories.push(owner.directory + '/Private', ...owner.privateIncludePaths);
@@ -439,7 +514,7 @@ export class CppIncludeEnvironment {
     const visit = (name: string) => {
       if (visited.has(name)) return;
       visited.add(name);
-      const candidates = this.modules!.filter(m => m.name === name);
+      const candidates = this.moduleNames.get(name) ?? [];
       if (candidates.length !== 1) { complete = false; return; }
       const module = candidates[0]!;
       observeModule(module);
@@ -450,7 +525,11 @@ export class CppIncludeEnvironment {
     for (const dependency of [...owner.publicDependencies, ...owner.publicIncludeModules,
       ...(isPublic ? [] : [...owner.privateDependencies, ...owner.privateIncludeModules])]) visit(dependency);
     if (!complete) this.complete = false;
-    return [{ id: `ue-static:${digest(JSON.stringify([owner.name, directories, complete]))}`, directories, complete, heuristic: true }];
+    const environments = [{ id: `ue-static:${digest(JSON.stringify([owner.name, directories, complete]))}`, directories, complete, heuristic: true }];
+    if (!scopes) { scopes = new Map(); this.moduleScopes.set(owner, scopes); }
+    scopes.set(isPublic, environments);
+    this.moduleFiles.set(file, environments);
+    return environments;
   }
 
   private deriveHeaderEnvironments(): void {
