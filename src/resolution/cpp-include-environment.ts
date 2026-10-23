@@ -310,6 +310,11 @@ export class CppIncludeEnvironment {
   }
 
   snapshot(previous?: string | null): CppIncludeSnapshot {
+    // Synthesis can discard the resolver that observed includes. Rebuild the
+    // fallback metadata closure per module, even when no include was replayed.
+    if (!this.databasePresent) for (const observation of this.getUeModuleRules()) {
+      if (observation.rules.isModuleRules) this.moduleScope(observation, false);
+    }
     const files = [...new Set([...this.context.getAllFiles().filter(file => {
       const language = this.context.getFileLanguage ? this.context.getFileLanguage(file) : this.context.getNodesInFile(file)[0]?.language;
       return language === 'c' || language === 'cpp';
@@ -494,9 +499,16 @@ export class CppIncludeEnvironment {
     if (!ownerObservation) { this.moduleFiles.set(file, undefined); return undefined; }
     const owner = ownerObservation.rules;
     const isPublic = file.startsWith(owner.directory + '/Public/') || file.startsWith(owner.directory + '/Classes/');
+    const environments = this.moduleScope(ownerObservation, isPublic);
+    this.moduleFiles.set(file, environments);
+    return environments;
+  }
+
+  private moduleScope(ownerObservation: UeModuleObservation, isPublic: boolean): Environment[] {
+    const owner = ownerObservation.rules;
     let scopes = this.moduleScopes.get(owner);
     const cached = scopes?.get(isPublic);
-    if (cached) { this.moduleFiles.set(file, cached); return cached; }
+    if (cached) return cached;
     const observeModule = (module: UeModuleRules) => {
       const entry = this.moduleByRules.get(module);
       if (!entry) return;
@@ -528,7 +540,6 @@ export class CppIncludeEnvironment {
     const environments = [{ id: `ue-static:${digest(JSON.stringify([owner.name, directories, complete]))}`, directories, complete, heuristic: true }];
     if (!scopes) { scopes = new Map(); this.moduleScopes.set(owner, scopes); }
     scopes.set(isPublic, environments);
-    this.moduleFiles.set(file, environments);
     return environments;
   }
 

@@ -51,6 +51,17 @@ function fixture(additional: Record<string, string> = {}) {
   return { root, files, context, environment: new CppIncludeEnvironment(context) };
 }
 
+function resolverFor(root: string, files: Record<string, string>): ReferenceResolver {
+  const graph = CodeGraph.initSync(root); graphs.push(graph);
+  for (const [file, content] of Object.entries(files)) {
+    if (file.endsWith('.uplugin')) continue;
+    graph.queries.upsertFile({ path: file, contentHash: createHash('sha256').update(content).digest('hex'),
+      language: file.endsWith('.cs') ? 'csharp' : 'cpp', size: Buffer.byteLength(content),
+      modifiedAt: fs.statSync(path.join(root, file)).mtimeMs, indexedAt: Date.now(), nodeCount: 0 });
+  }
+  return new ReferenceResolver(root, graph.queries);
+}
+
 beforeAll(async () => { await ensureUeModuleGrammar(); });
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -129,6 +140,62 @@ describe('UE include environment batch caches', () => {
     expect(environment.snapshot(JSON.stringify({ ...previous, bounded: false }))).toMatchObject({ bounded: false, complete: false });
   });
 
+  it.each([false, true])('stamps every module closure without include replay after cache clear: %s', cleared => {
+    const inline = `${main}/Private/body.inl`;
+    const dependent = 'Plugins/Feature/Source/Feature/Feature.Build.cs';
+    const descriptor = 'Plugins/Feature/Feature.uplugin';
+    const { root, files } = fixture({
+      [inline]: 'inline void Use() {}',
+      'Source/Secret/Secret.Build.cs': rules('Secret', 'PublicDependencyModuleNames.Add("Feature");'),
+      [dependent]: rules('Feature', 'PublicDependencyModuleNames.Add("Leaf");'),
+      [descriptor]: JSON.stringify({ Modules: [{ Name: 'Feature' }] }),
+    });
+    const resolver = resolverFor(root, files);
+    if (cleared) {
+      expect(resolver.getResolutionContext().resolveCppInclude!(first, 'Shared.h', '<').status).toBe('resolved');
+      resolver.clearCaches();
+    }
+    resolver.getResolutionContext().getUeModuleRules!();
+    const previous = JSON.stringify({ version: 1, complete: false, bounded: true, ueModules: false, files: [first, inline], dependencies: [] });
+    const snapshot = resolver.getCppIncludeSnapshot(previous);
+    for (const file of [dependent, descriptor]) {
+      expect(snapshot.dependencies.find(dep => dep.path === file)?.owners).toContain(mainRules);
+    }
+    const raw = JSON.stringify(snapshot);
+    expect(checkCppIncludeSnapshot(root, raw)).toMatchObject({ changed: false, inputsVerified: true });
+    fs.writeFileSync(path.join(root, dependent), rules('Feature', 'PublicDependencyModuleNames.Add("Shared");'));
+    const changedRules = checkCppIncludeSnapshot(root, raw);
+    expect(resolver.getCppIncludeAffectedFiles(changedRules.affectedFiles)).toEqual(expect.arrayContaining([first, second, inline]));
+    fs.writeFileSync(path.join(root, dependent), files[dependent]!);
+    fs.writeFileSync(path.join(root, descriptor), JSON.stringify({ Modules: [{ Name: 'Feature', PlatformAllowList: ['Win64'] }] }));
+    const changedDescriptor = checkCppIncludeSnapshot(root, raw);
+    expect(resolver.getCppIncludeAffectedFiles(changedDescriptor.affectedFiles)).toEqual(expect.arrayContaining([first, second, inline]));
+  });
+
+  it('reuses module closures when a fresh resolver stamps repeatedly', () => {
+    const { environment } = fixture();
+    const observations = environment.getUeModuleRules();
+    let dependencyReads = 0;
+    for (const observation of observations) {
+      const dependencies = observation.rules.publicDependencies;
+      Object.defineProperty(observation.rules, 'publicDependencies', { get: () => { dependencyReads++; return dependencies; } });
+    }
+    const snapshot = environment.snapshot();
+    expect(dependencyReads).toBeGreaterThan(0);
+    const firstWalk = dependencyReads;
+    environment.snapshot(JSON.stringify(snapshot));
+    expect(dependencyReads).toBe(firstWalk);
+    expect(snapshot.dependencies.find(dep => dep.path === 'Source/Leaf/Leaf.Build.cs')?.owners).toContain(mainRules);
+  });
+
+  it('initializes closure observations through the direct environment snapshot entry point', () => {
+    const { environment } = fixture();
+    const snapshot = environment.snapshot();
+    expect(snapshot.ueModules).toBe(true);
+    expect(snapshot.dependencies.find(dep => dep.path === 'Source/Leaf/Leaf.Build.cs')?.owners).toContain(mainRules);
+    expect(snapshot.dependencies.find(dep => dep.path === 'Source/Secret/Secret.Build.cs')?.owners).toContain(mainRules);
+  });
+
   it('passes expanded module files through compiler-derived header environments', () => {
     const included = 'External/Public/External.h';
     const { root, context } = fixture({ [included]: 'struct ExternalHeader {};' });
@@ -168,14 +235,7 @@ describe('UE include environment batch caches', () => {
 
   it('drops scope caches on resolver clearCaches after same-size, restored-mtime rules edits', () => {
     const { root, files } = fixture();
-    const graph = CodeGraph.initSync(root); graphs.push(graph);
-    for (const [file, content] of Object.entries(files)) {
-      if (file.endsWith('.uplugin')) continue;
-      graph.queries.upsertFile({ path: file, contentHash: createHash('sha256').update(content).digest('hex'),
-        language: file.endsWith('.cs') ? 'csharp' : 'cpp', size: Buffer.byteLength(content),
-        modifiedAt: fs.statSync(path.join(root, file)).mtimeMs, indexedAt: Date.now(), nodeCount: 0 });
-    }
-    const resolver = new ReferenceResolver(root, graph.queries);
+    const resolver = resolverFor(root, files);
     const context = resolver.getResolutionContext();
     expect(context.resolveCppInclude!(first, 'Shared.h', '<').status).toBe('resolved');
     const snapshot = JSON.stringify(resolver.getCppIncludeSnapshot());
