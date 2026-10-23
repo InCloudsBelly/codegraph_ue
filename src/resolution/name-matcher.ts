@@ -14408,12 +14408,14 @@ function cppLiteralEnd(text: string, start: number): number {
  * body, or to the end of its one statement — taken to be the first `;` or
  * closing `}` at its own depth, so an `else` after it is not counted.
  * Comments and literals are skipped, and a `for` inside one (commented-out
- * code, a code generator's template) has no body.
+ * code, a code generator's template) has no body. A control initializer also
+ * holds in its remaining header; an if initializer holds in its else body.
  */
-function cppForBodyEncloses(lines: readonly string[], line: number, paren: number, useLine: number, useColumn: number): boolean {
-  let phase: 'before' | 'header' | 'gap' | 'block' | 'statement' = 'before';
+function cppForBodyEncloses(lines: readonly string[], line: number, paren: number, useLine: number, useColumn: number, initializer?: 'for' | 'if' | 'switch'): boolean {
+  let phase: 'before' | 'header' | 'gap' | 'block' | 'statement' | 'afterBody' = 'before';
   let depth = 0;
   let comment = false;
+  let elsePending = initializer === 'if';
   for (let l = line; l <= useLine && l < lines.length; l++) {
     const text = lines[l]!;
     const end = l === useLine ? Math.min(useColumn, text.length) : text.length;
@@ -14449,17 +14451,27 @@ function cppForBodyEncloses(lines: readonly string[], line: number, paren: numbe
         else if (ch === ')' && --depth === 0) phase = 'gap';
         continue;
       }
+      if (phase === 'afterBody') {
+        if (/\s/.test(ch)) continue;
+        if (!/^else\b/.test(text.slice(c))) return false;
+        elsePending = false;
+        phase = 'gap';
+        c += 3;
+        continue;
+      }
       if (phase === 'gap') {
         if (/\s/.test(ch)) continue;
         phase = ch === '{' ? 'block' : 'statement';
       }
       if (ch === '(' || ch === '[' || ch === '{') depth++;
       else if (ch === ')' || ch === ']') depth--;
-      else if (ch === '}' && --depth <= 0) return false;
-      else if (ch === ';' && depth <= 0 && phase === 'statement') return false;
+      else if ((ch === '}' && --depth <= 0) || (ch === ';' && depth <= 0 && phase === 'statement')) {
+        if (!elsePending) return false;
+        phase = 'afterBody';
+      }
     }
   }
-  return phase !== 'before' && phase !== 'header';
+  return phase !== 'before' && phase !== 'afterBody' && (phase !== 'header' || initializer !== undefined);
 }
 
 /** What C++ receiver inference made of a receiver's declared type. */
@@ -15192,14 +15204,14 @@ function cppImplicitThisMethod(name: string, receiver: 'bare' | 'this', caller: 
 const CPP_THIS_RECEIVER = /^(?:this\s*->|\(\s*\*\s*this\s*\)\s*\.)\s*(?:template\s+)?/;
 
 /**
- * How a C++ call the extractor recorded by its bare name is written, read at
+ * How a C++ name the extractor recorded without its receiver is written, read at
  * its column: `'bare'` with no receiver, `'this'` on `this->` / `(*this).`,
  * null for anything else. The extractor also drops receivers it can't spell
  * (`arr_[0].Foo()`, `(p_)->Foo()`, `this->p_->Foo()`), whose calls are no
  * member of the caller's class; and a name its argument list doesn't follow
- * is no call of it.
+ * is no call of it. Value references only require the name at that position.
  */
-function cppImplicitReceiver(ref: UnresolvedRef, context: ResolutionContext): 'bare' | 'this' | null {
+function cppImplicitReceiver(ref: UnresolvedRef, context: ResolutionContext, requireCall = true): 'bare' | 'this' | null {
   const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
   if (line === undefined) return null;
   const at = (column: number): 'bare' | 'this' | null => {
@@ -15211,7 +15223,7 @@ function cppImplicitReceiver(ref: UnresolvedRef, context: ResolutionContext): 'b
     if (!onThis && /(?:\.|->|::)$/.test(before)) return null;
     const rest = text.slice(self.length);
     if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
-    return cppArgumentListFollows(rest, ref.referenceName.length) ? (onThis ? 'this' : 'bare') : null;
+    return !requireCall || cppArgumentListFollows(rest, ref.referenceName.length) ? (onThis ? 'this' : 'bare') : null;
   };
   const verdict = at(Math.max(0, ref.column));
   if (verdict !== null || !/[^\x00-\x7f]/.test(line)) return verdict;
@@ -15570,9 +15582,25 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
  * reads them fit best (cppArgumentTypeFit); the first on a tie, unless a
  * const twin of it fits the arguments' constness better (cppConstTwinChoice).
  */
+const CPP_ARGUMENT_TYPE_INFERENCE_DEPTH = new WeakMap<ResolutionContext, number>();
+const CPP_MAX_ARGUMENT_TYPE_INFERENCE_DEPTH = 4;
+
 function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: UnresolvedRef, context: ResolutionContext): Node {
   if (tied.length === 1 || args.length === 0) return tied[0]!;
-  const types = args.map((arg) => cppArgumentType(arg, ref, context));
+  // A nested call's expression type can look up another overload, whose
+  // argument types can lead back to the same call site. cppExpressionType's
+  // own depth is reset at cppArgumentType, so bound this cross-layer recursion
+  // here and use the same stable first-overload fallback as unknown arguments.
+  const depth = CPP_ARGUMENT_TYPE_INFERENCE_DEPTH.get(context) ?? 0;
+  if (depth >= CPP_MAX_ARGUMENT_TYPE_INFERENCE_DEPTH) return tied[0]!;
+  CPP_ARGUMENT_TYPE_INFERENCE_DEPTH.set(context, depth + 1);
+  let types: Array<CppArgumentType | null>;
+  try {
+    types = args.map((arg) => cppArgumentType(arg, ref, context));
+  } finally {
+    if (depth === 0) CPP_ARGUMENT_TYPE_INFERENCE_DEPTH.delete(context);
+    else CPP_ARGUMENT_TYPE_INFERENCE_DEPTH.set(context, depth);
+  }
   if (types.every((t) => t === null)) return tied[0]!;
   const fits = tied.map((n) => cppArgumentTypeFit(n, name, types, context));
   const top = Math.max(...fits);
@@ -16228,8 +16256,8 @@ const CPP_LOCAL_SPECIFIERS = String.raw`(?:(?:const|constexpr|static|volatile|th
 // template arguments may hold a function type's parentheses, which CPP_TEMPLATE_ARGUMENTS leaves out.
 const CPP_LOCAL_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;={}]|<(?:[^<>;={}]|<[^<>;={}]*>)*>)*>`;
 const CPP_LOCAL_TYPE = String.raw`(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*${CPP_LOCAL_TEMPLATE_ARGUMENTS}(?:\s*::\s*[A-Za-z_]\w*)*)?`;
-// Where a statement starts on a line of code: the line's start, or after `;`, `{`, `}`, or a `for`/`if` header's `(`.
-const CPP_STATEMENT_START = String.raw`(?:^|[;{}]|\b(?:for|if)\s*\()\s*`;
+// Where a statement starts: the line's start, a delimiter, or a for/if/switch header's `(`.
+const CPP_STATEMENT_START = String.raw`(?:^|[;{}]|\b(?:for|if|switch)\s*\()\s*`;
 // Declarations that start a statement, the declared name captured: `auto key = …`, `Formatter format(p);`,
 // `const Formatter& format = …`, and the local types `using V = …;`, `typedef … V;`, `struct Getter {`.
 const CPP_AUTO_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}auto(?:\s+|\s*[*&]+\s*)([A-Za-z_]\w*)\s*(?:=|\{|\()`, 'g');
@@ -16255,14 +16283,24 @@ interface CppLocalBinding {
    * constructs or calls instead.
    */
   kind: 'parameter' | 'variable' | 'type' | 'function';
-  /** Where its scope starts: the statement's column, or just inside the `{` of a lambda whose parameter it is. */
+  /** Where its scope starts: the declared name, or just inside the `{` of a lambda whose parameter it is. */
   column: number;
   /** For a range-`for` variable: the column of the loop header's `(`, whose body is its scope. */
   loopParen?: number;
+  /** An initializer's variable also holds in the control header, and ends with that statement. */
+  control?: { kind: 'for' | 'if' | 'switch'; paren: number };
 }
 
 const CPP_LOCAL_BINDINGS = new WeakMap<ResolutionContext, Map<string, CppLocalBinding[]>>();
 const CPP_CALLER_HEADS = new WeakMap<ResolutionContext, Map<string, { parameters: Set<string>; body: number }>>();
+
+/** The control header this declaration starts, including a later name in its declarator list. */
+function cppLocalControl(text: string, declaration: RegExpExecArray | RegExpMatchArray): CppLocalBinding['control'] {
+  const own = /^\s*(for|if|switch)\s*\(/.exec(declaration[0]);
+  if (own) return { kind: own[1] as 'for' | 'if' | 'switch', paren: declaration.index! + own[0].lastIndexOf('(') };
+  const before = /\b(for|if|switch)\s*\(\s*$/.exec(text.slice(0, declaration.index));
+  return before ? { kind: before[1] as 'for' | 'if' | 'switch', paren: before.index + before[0].lastIndexOf('(') } : undefined;
+}
 
 /**
  * The names a C++ parameter list declares: `const Formatter& format, int n
@@ -16366,10 +16404,10 @@ function cppLocalBindings(
     if (!cppHasWord(text, name)) continue;
     const starts = (index: number): boolean => index > 0 || l === head.body || startsStatement(l);
     for (const m of text.matchAll(CPP_LOCAL_TYPE_DECLARATION)) {
-      if ((m[1] ?? m[2] ?? m[3]) === name && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'type' });
+      if ((m[1] ?? m[2] ?? m[3]) === name && starts(m.index)) bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind: 'type' });
     }
     for (const m of text.matchAll(CPP_AUTO_LOCAL)) {
-      if (m[1] === name && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'variable' });
+      if (m[1] === name && starts(m.index)) bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind: 'variable', control: cppLocalControl(text, m) });
     }
     for (const m of text.matchAll(CPP_TYPED_LOCAL)) {
       const type = m[1]!;
@@ -16381,11 +16419,13 @@ function cppLocalBindings(
         if (/[*&]/.test(m[2]!)) continue;
         if (cppDeclaresLocalFunction(type, cppParenTextFrom(codeLine, l, m.index + m[0].length - 1) ?? '')) kind = 'function';
       }
-      bindings.push({ line: l, column: m.index, kind });
+      // The statement pattern may include its opening `{`; starting at the
+      // name keeps that enclosing block's `}` from being counted as still open.
+      bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind, control: cppLocalControl(text, m) });
     }
     if (text.includes(',')) {
       const m = cppListedDeclaratorOn(text, name);
-      if (m && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'variable' });
+      if (m && starts(m.index)) bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind: 'variable', control: cppLocalControl(text, m) });
     }
     const loop = cppRangeForDeclaration(text, name);
     if (loop) bindings.push({ line: l, column: loop.paren, kind: 'variable', loopParen: loop.paren });
@@ -16411,9 +16451,9 @@ function cppBlockReaches(codeLine: (line: number) => string, line: number, colum
 }
 
 /**
- * Whether a C++ call written by its bare name calls a local of the calling
- * function — a parameter, a lambda's parameter, a range-`for` variable, or a
- * variable declared above the call in a block still open there — which C++
+ * Whether a C++ call or value reference written by its bare name uses a local
+ * of the calling function — a parameter, a lambda's parameter, a range-`for`
+ * variable, or a variable declared above it in a block still open there — which C++
  * lookup finds before any function or method of that name. protobuf's code
  * generators call `format(…)` on a `const Formatter& format` parameter,
  * which linked to the conformance suite's `TestResult::format`, and rocksdb's
@@ -16422,12 +16462,12 @@ function cppBlockReaches(codeLine: (line: number) => string, line: number, colum
  * V = std::vector<int>;`) or a function (`void helper(int);`) is not one:
  * that call constructs the type or calls the function.
  */
-function isCppLocalCallableCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+export function isCppLocalValueRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const name = ref.referenceName;
-  if (!/^[A-Za-z_]\w*$/.test(name) || cppImplicitReceiver(ref, context) !== 'bare') return false;
+  if (!/^[A-Za-z_]\w*$/.test(name) || cppImplicitReceiver(ref, context, ref.referenceKind === 'calls') !== 'bare') return false;
   const caller = context.getNodeById?.(ref.fromNodeId);
   if (!caller || (caller.kind !== 'function' && caller.kind !== 'method') || caller.filePath !== ref.filePath ||
-      caller.name === name || ref.line < caller.startLine || ref.line > (caller.endLine ?? caller.startLine)) return false;
+      (ref.referenceKind === 'calls' && caller.name === name) || ref.line < caller.startLine || ref.line > (caller.endLine ?? caller.startLine)) return false;
   const rawLines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!rawLines) return false;
   const nonCode = cppNonCodeLines(ref.filePath, context);
@@ -16451,7 +16491,9 @@ function isCppLocalCallableCall(ref: UnresolvedRef, context: ResolutionContext):
   for (const b of bindings) {
     if (b.line > callLine || (b.line === callLine && b.column >= ref.column)) continue;
     const inScope = b.kind === 'parameter' ||
-      (b.loopParen !== undefined
+      (b.control !== undefined
+        ? cppForBodyEncloses(rawLines, b.line, b.control.paren, callLine, ref.column, b.control.kind)
+        : b.loopParen !== undefined
         ? cppForBodyEncloses(rawLines, b.line, b.loopParen, callLine, ref.column)
         : cppBlockReaches(codeLine, b.line, b.column, callLine, ref.column));
     if (inScope && (!decided || b.line > decided.line || (b.line === decided.line && b.column > decided.column))) decided = b;
@@ -24902,16 +24944,16 @@ export function matchReference(
     // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
     if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
   }
-  // So does one a C++ function binds — a parameter, a lambda's parameter, a
-  // local lambda or functor: protobuf's generators' `format(…)` on a `const
-  // Formatter& format` is no `TestResult::format`. (Something the function
-  // itself declares, which the index may hold, is what the name is.)
-  if (result && ref.language === 'cpp' && ref.referenceKind === 'calls') {
+  // C++ locals shadow names for both calls and value reads. AxFImporter's
+  // `Product->B.Connect(B.OutputIndex, B.Expression)` reads its local Product
+  // and parameter B, never an unrelated enum's Product or material's B method.
+  // A local type or function still names its own declaration.
+  if (result && ref.language === 'cpp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references')) {
     const target = context.getNodeById?.(result.targetNodeId);
     const caller = context.getNodeById?.(ref.fromNodeId);
     const own = target && caller && target.filePath === caller.filePath &&
       target.startLine >= caller.startLine && target.startLine <= (caller.endLine ?? caller.startLine);
-    if (!own && isCppLocalCallableCall(ref, context)) return null;
+    if ((ref.referenceKind === 'references' || !own) && isCppLocalValueRef(ref, context)) return null;
   }
   // R looks a call's name up among FUNCTIONS only, skipping other bindings:
   // ggplot2's tests' `c <- data_frame(b = 3)` is never what `c(1, 2)` calls —

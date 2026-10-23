@@ -13,7 +13,7 @@ export interface PendingChangeCounts {
 const MEASURE_TIMEOUT_MS = 8_000;
 let liveMeasurements = 0;
 const active = new Map<string, Promise<PendingChangeCounts | null>>();
-export interface CppIncludeFreshness { observed: boolean; complete: boolean; changed: boolean; reason?: string }
+export interface CppIncludeFreshness { observed: boolean; complete: boolean; inputsVerified?: boolean; changed: boolean; reason?: string }
 const includeActive = new Map<string, Promise<CppIncludeFreshness | null>>();
 export function measureCppIncludeEnvironment(root: string, timeoutMs = MEASURE_TIMEOUT_MS): Promise<CppIncludeFreshness | null> {
   const key = path.resolve(root);
@@ -22,6 +22,8 @@ export function measureCppIncludeEnvironment(root: string, timeoutMs = MEASURE_T
   if (liveMeasurements >= 2) return Promise.resolve(null);
   const pending = runMeasurement<CppIncludeFreshness>(key, timeoutMs, 'cpp-includes', value => {
     if (!value || typeof value !== 'object' || !['observed', 'complete', 'changed'].every(k => typeof (value as Record<string, unknown>)[k] === 'boolean')) return null;
+    const inputsVerified = (value as Record<string, unknown>).inputsVerified;
+    if (inputsVerified !== undefined && typeof inputsVerified !== 'boolean') return null;
     return value as CppIncludeFreshness;
   }).finally(() => includeActive.delete(key));
   includeActive.set(key, pending); return pending;

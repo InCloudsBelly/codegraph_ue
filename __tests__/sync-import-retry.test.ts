@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
-import { DatabaseConnection } from '../src/db';
+import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from '../src/db';
 import { CURRENT_SCHEMA_VERSION, getCurrentVersion, runMigrations } from '../src/db/migrations';
 import { QueryBuilder } from '../src/db/queries';
 import { importPathKeys } from '../src/db/reference-tail';
@@ -277,12 +277,11 @@ describe('sync links an import of a file that appears after the importer', () =>
     expect(synced.ownStatements).toBe(0);
     expect(cg.getPendingReferenceCount()).toBe(0);
 
-    // A full re-index links the same. It has to start from an empty database,
-    // as `codegraph index` does: indexAll over this one skips the unchanged
-    // importer and keeps the edges the sync wrote. Close first: recreate
-    // unlinks the database file, which a held handle makes EBUSY on Windows.
+    // Build an independent fresh graph as the convergence oracle. Explicit
+    // cleanup here is safe only because root is this test's throwaway fixture.
     cg.close();
-    cg = await CodeGraph.recreate(root);
+    removeDatabaseFiles(getDatabasePath(root));
+    cg = CodeGraph.initSync(root);
     await cg.indexAll();
     expect(importsOf(c.from)).toEqual(synced);
   }, 60_000);

@@ -26,10 +26,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
-import { logWarn } from './errors';
+import { ConfigError, logWarn } from './errors';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
+
+/** Losing scope rules to an I/O failure must never look like an empty config. */
+function throwUnlessConfigMissing(file: string, operation: string, error: unknown): void {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (code === 'ENOENT' || code === 'ENOTDIR') return;
+  throw new ConfigError(`Could not ${operation} scope configuration ${file}: ${error instanceof Error ? error.message : String(error)}`, { file, code });
+}
 
 export interface ProjectConfig {
   /** Map of custom file extension (`.foo`) to a supported language id. */
@@ -138,14 +145,15 @@ function normalizeExtKey(raw: string): string | null {
 
 /**
  * Read + JSON-parse a `codegraph.json` once and return its validated view.
- * Every failure mode degrades to the zero-config default — a missing file, bad
- * JSON, or a typo'd value never throws.
+ * Missing files, bad JSON, and typo'd values retain the zero-config default.
+ * I/O failures propagate so an existing index cannot lose its configured scope.
  */
 function parseConfig(file: string): ParsedConfig {
   let raw: string;
   try {
     raw = fs.readFileSync(file, 'utf-8');
-  } catch {
+  } catch (error) {
+    throwUnlessConfigMissing(file, 'read', error);
     return EMPTY_CONFIG;
   }
 
@@ -317,7 +325,8 @@ function loadParsedConfig(rootDir: string): ParsedConfig {
   let mtimeMs: number;
   try {
     mtimeMs = fs.statSync(file).mtimeMs;
-  } catch {
+  } catch (error) {
+    throwUnlessConfigMissing(file, 'stat', error);
     // No config file — drop any stale cache entry and return the default.
     cache.delete(rootDir);
     return EMPTY_CONFIG;

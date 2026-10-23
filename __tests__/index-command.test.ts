@@ -2,12 +2,8 @@
  * Regression coverage for issue #874: `codegraph index` produced 0 nodes / 0
  * edges while `codegraph init` worked, and appeared to wipe the graph.
  *
- * Root cause: `index` ran a full extraction against the already-populated DB
- * without clearing it first. Every file's content hash still matched, so the
- * orchestrator skipped re-inserting all of them, and the run reported its delta
- * (after - before = 0) as "0 nodes, 0 edges". The fix makes `index` a true full
- * rebuild — clear, then re-index — so it produces the same complete result as a
- * fresh `init`.
+ * Raw rebuilds now refuse existing artifacts. Updates use sync; independent
+ * candidates must be validated before replacing a last-good database.
  *
  * Exercised end-to-end against the built binary so the CLI wiring (not just the
  * library) is covered.
@@ -71,7 +67,7 @@ function startDetachedProcess(): number {
   return pid;
 }
 
-describe('codegraph index — full re-index keeps the graph populated (#874)', () => {
+describe('codegraph index — refuses destruction and keeps the graph populated (#874)', () => {
   let tempDir: string;
 
   beforeEach(() => {
@@ -93,29 +89,28 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('reproduces init\'s node/edge counts instead of emptying the index', () => {
+  it('refuses replacement and preserves init\'s nodes and edges', () => {
     runCodegraph(['init'], tempDir);
     const afterInit = graphCounts(tempDir);
     expect(afterInit.nodes).toBeGreaterThan(0);
     expect(afterInit.edges).toBeGreaterThan(0);
 
-    const out = runCodegraph(['index'], tempDir);
+    const before = fs.readFileSync(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    expect(() => runCodegraph(['index'], tempDir)).toThrow(/preserving existing index/);
+    expect(fs.readFileSync(path.join(tempDir, '.codegraph', 'codegraph.db')).equals(before)).toBe(true);
     const afterIndex = graphCounts(tempDir);
 
-    // The graph is still fully populated — `index` rebuilt it, it did not wipe it.
+    // The graph stays fully populated after refusal.
     expect(afterIndex.nodes).toBe(afterInit.nodes);
     expect(afterIndex.edges).toBe(afterInit.edges);
 
-    // ...and the CLI reported the real counts, never the misleading "0 nodes".
-    expect(out).not.toMatch(/\b0 nodes, 0 edges\b/);
-    expect(out).toMatch(new RegExp(`\\b${afterInit.nodes} nodes\\b`));
   });
 
-  it('is idempotent: a second index does not grow the graph', () => {
+  it('repeated refusals do not grow or modify the graph', () => {
     runCodegraph(['init'], tempDir);
-    runCodegraph(['index'], tempDir);
+    expect(() => runCodegraph(['index'], tempDir)).toThrow(/preserving existing index/);
     const first = graphCounts(tempDir);
-    runCodegraph(['index'], tempDir);
+    expect(() => runCodegraph(['index'], tempDir)).toThrow(/preserving existing index/);
     const second = graphCounts(tempDir);
 
     // A clean rebuild each time — no duplicate (re-resolved) edges accumulating
@@ -124,11 +119,11 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
     expect(second.edges).toBe(first.edges);
   });
 
-  it('--quiet path also rebuilds a populated graph', () => {
+  it('--quiet also refuses replacement and preserves a populated graph', () => {
     runCodegraph(['init'], tempDir);
     const afterInit = graphCounts(tempDir);
 
-    runCodegraph(['index', '--quiet'], tempDir);
+    expect(() => runCodegraph(['index', '--quiet'], tempDir)).toThrow(/preserving existing index/);
     const afterIndex = graphCounts(tempDir);
 
     expect(afterIndex.nodes).toBe(afterInit.nodes);
@@ -150,7 +145,7 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
     );
 
     try {
-      expect(() => runCodegraph(['index', '--quiet'], tempDir)).toThrow(/could not verify.*daemon/i);
+      expect(() => runCodegraph(['index', '--quiet'], tempDir)).toThrow(/preserving existing index/);
       expect(isAlive(daemonPid)).toBe(true);
       expect(fs.existsSync(lockPath)).toBe(true);
     } finally {
@@ -163,15 +158,10 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
  * Regression coverage for issue #1067: a full re-index must RECOVER an existing
  * oversized/stale index from earlier versions, not wedge on it.
  *
- * Root cause: `index` opened the old database and DELETE-d every row to clear
- * it. With FTS triggers firing per deleted node, a pre-fix poisoned graph (an
- * ignored gitlink corpus scanned into ~1.6M nodes + a multi-GB WAL, #1065) took
- * well over the 60s liveness-watchdog window to clear, so the process was
- * SIGKILLed before scanning even began and the bad state could never be rebuilt
- * away. The fix discards (unlinks) the database files and re-initializes a fresh
- * one — O(1) regardless of size — so `index` recovers any prior state.
+ * A stale graph still must not be discarded before a candidate succeeds.
+ * Raw index now refuses it; sync can apply confirmed filesystem deletions.
  */
-describe('codegraph index — recovers a stale/oversized prior index (#1067)', () => {
+describe('codegraph index — preserves a stale/oversized prior index (#1067)', () => {
   let tempDir: string;
   const dbPath = (dir: string) => path.join(dir, '.codegraph', 'codegraph.db');
 
@@ -188,7 +178,7 @@ describe('codegraph index — recovers a stale/oversized prior index (#1067)', (
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('rebuilds to the current disk state, discarding content for files that no longer exist', () => {
+  it('preserves the old graph on refusal, then sync applies confirmed deletions', () => {
     // Stand in for the "old graph indexed an ignored corpus" shape: index a tree
     // that also has a junk/ directory, then delete junk/ from disk so the DB now
     // carries stale nodes for paths that should no longer be indexed.
@@ -204,7 +194,9 @@ describe('codegraph index — recovers a stale/oversized prior index (#1067)', (
     // oversized prior state #1067 is about.
     fs.rmSync(junkDir, { recursive: true, force: true });
 
-    runCodegraph(['index'], tempDir);
+    expect(() => runCodegraph(['index'], tempDir)).toThrow(/preserving existing index/);
+    expect(graphCounts(tempDir)).toEqual(withJunk);
+    runCodegraph(['sync'], tempDir);
     const recovered = graphCounts(tempDir);
 
     // The rebuild reflects only what's on disk now — the junk nodes are gone…
@@ -223,26 +215,21 @@ describe('codegraph index — recovers a stale/oversized prior index (#1067)', (
     }
   });
 
-  // The fix rebuilds a fresh DB rather than DELETE-ing rows in place. Prove it
-  // with a header sentinel: PRAGMA user_version survives an in-place clear but
-  // not a from-scratch recreate. (An inode check is unreliable — ext4/overlayfs
-  // recycle the inode number after unlink+recreate.)
-  it('rebuilds a fresh database rather than clearing the old one in place', () => {
+  // A header sentinel proves refusal retains the original physical database.
+  it('retains the old database and its header on refusal', () => {
     runCodegraph(['init'], tempDir);
 
     const stamp = DatabaseConnection.open(dbPath(tempDir));
     stamp.getDb().pragma('user_version = 4242');
     stamp.close();
 
-    runCodegraph(['index'], tempDir);
+    expect(() => runCodegraph(['index'], tempDir)).toThrow(/preserving existing index/);
 
     const check = DatabaseConnection.open(dbPath(tempDir));
     const userVersion = pragmaValue(check.getDb().pragma('user_version'), 'user_version');
     check.close();
 
-    // Sentinel gone → `index` discarded the old DB and rebuilt it, the path that
-    // avoids the per-row FTS delete wedge on a poisoned graph (#1067).
-    expect(Number(userVersion)).not.toBe(4242);
+    expect(Number(userVersion)).toBe(4242);
 
     // …and the graph is intact afterwards.
     const counts = graphCounts(tempDir);

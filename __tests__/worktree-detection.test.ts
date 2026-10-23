@@ -57,10 +57,11 @@ describe('detectWorktreeIndexMismatch (issue #155)', () => {
     git(mainRepo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     try { git(mainRepo, 'worktree', 'remove', '--force', worktree); } catch { /* best effort */ }
-    fs.rmSync(mainRepo, { recursive: true, force: true });
-    fs.rmSync(nonGit, { recursive: true, force: true });
+    // Async retries allow Windows to finish releasing Git's process handles.
+    await fs.promises.rm(mainRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    await fs.promises.rm(nonGit, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
 
   it('flags a worktree borrowing the main checkout index', () => {
@@ -293,9 +294,9 @@ describe('detectWorktreeIndexMismatch — nested repos covered by the parent ind
     git(parent, 'commit', '-q', '-m', 'init');
   });
 
-  afterEach(() => {
-    fs.rmSync(parent, { recursive: true, force: true });
-    fs.rmSync(subSource, { recursive: true, force: true });
+  afterEach(async () => {
+    await fs.promises.rm(parent, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    await fs.promises.rm(subSource, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
 
   function addSubmodule(name: string): string {

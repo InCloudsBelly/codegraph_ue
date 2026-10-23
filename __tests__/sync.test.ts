@@ -13,19 +13,21 @@ import * as os from 'os';
 import { execFileSync } from 'child_process';
 import CodeGraph, { LockUnavailableError } from '../src/index';
 import { QueryBuilder } from '../src/db/queries';
+import { getDatabasePath, removeDatabaseFiles } from '../src/db';
 import { __emitWatchEventForTests } from '../src/sync/watcher';
 
 /**
- * Index `cg`'s project again from an empty database, as `codegraph index`
- * does, and return the new handle: the graph a synced index has to match.
+ * Index this throwaway fixture again from an explicitly emptied database,
+ * and return the new handle: the graph a synced index has to match.
  * indexAll over the synced index is no stand-in — it skips every file whose
  * content is unchanged, so the edges the sync wrote survive it untouched.
  */
 async function reindexFromScratch(cg: CodeGraph): Promise<CodeGraph> {
   const root = cg.getProjectRoot();
-  // recreate unlinks the database file; a held handle makes that EBUSY on Windows.
+  // Test fixture cleanup requires all held handles to be closed on Windows.
   cg.close();
-  const rebuilt = await CodeGraph.recreate(root);
+  removeDatabaseFiles(getDatabasePath(root));
+  const rebuilt = CodeGraph.initSync(root);
   await rebuilt.indexAll();
   return rebuilt;
 }

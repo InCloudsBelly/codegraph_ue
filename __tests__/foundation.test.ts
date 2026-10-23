@@ -187,31 +187,27 @@ describe('CodeGraph Foundation', () => {
     });
   });
 
-  // recreate() backs `codegraph index`: it discards the existing DB and returns
-  // a fresh, empty instance rather than DELETE-clearing in place — the path that
-  // recovers a poisoned/oversized prior index without wedging (#1067).
+  // Raw recreation must never replace the last-good graph with an empty file.
   describe('Recreate (#1067)', () => {
-    it('returns a fresh, empty, usable instance', async () => {
+    it('refuses destructive recreation and retains a usable last-good graph', async () => {
       const cg = CodeGraph.initSync(tempDir);
-      // Give the DB some content so "empty afterwards" is meaningful.
+      // Give the DB content so preservation checks are meaningful.
       fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function f() { return 1; }\n');
       await cg.indexAll();
       expect(cg.getStats().nodeCount).toBeGreaterThan(0);
       cg.close();
 
-      const fresh = await CodeGraph.recreate(tempDir);
+      await expect(CodeGraph.recreate(tempDir)).rejects.toThrow(/preserving existing index/);
+      const fresh = CodeGraph.openSync(tempDir);
       try {
-        // Empty graph, but a working instance: re-indexing repopulates it.
-        expect(fresh.getStats().nodeCount).toBe(0);
-        const result = await fresh.indexAll();
-        expect(result.success).toBe(true);
         expect(fresh.getStats().nodeCount).toBeGreaterThan(0);
+        expect(fresh.searchNodes('f').length).toBeGreaterThan(0);
       } finally {
         fresh.close();
       }
     });
 
-    it('discards the old database file rather than emptying it in place', async () => {
+    it('preserves the original database header when refusing recreation', async () => {
       const cg = CodeGraph.initSync(tempDir);
       await cg.indexAll();
       cg.close();
@@ -226,17 +222,16 @@ describe('CodeGraph Foundation', () => {
       stamp.getDb().pragma('user_version = 4242');
       stamp.close();
 
-      const fresh = await CodeGraph.recreate(tempDir);
-      fresh.close();
+      const before = fs.readFileSync(dbPath);
+      await expect(CodeGraph.recreate(tempDir)).rejects.toThrow(/preserving existing index/);
+      expect(fs.readFileSync(dbPath).equals(before)).toBe(true);
 
-      // The file exists, and the sentinel is gone — proof the old DB was
-      // discarded and rebuilt, not row-DELETE'd in place (the path that wedged
-      // on a poisoned graph, #1067).
+      // Refusal must preserve the sentinel and every byte of the original.
       expect(fs.existsSync(dbPath)).toBe(true);
       const check = DatabaseConnection.open(dbPath);
       const userVersion = pragmaValue(check.getDb().pragma('user_version'), 'user_version');
       check.close();
-      expect(Number(userVersion)).not.toBe(4242);
+      expect(Number(userVersion)).toBe(4242);
     });
 
     it('throws a clear error when the project is not initialized', async () => {

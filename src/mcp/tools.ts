@@ -2686,11 +2686,14 @@ export class ToolHandler {
     try { cg = this.getCodeGraph(projectPath); } catch { return result; }
     if (!cg.hasCppIncludeFiles?.()) return result;
     const state = await measureCppIncludeEnvironment(cg.getProjectRoot());
-    if (state?.observed && state.complete && !state.changed) return result;
+    if (state?.observed && state.complete && !state.changed && state.inputsVerified !== false) return result;
     const [head, ...tail] = result.content;
     if (!head || head.type !== 'text') return result;
     const reason = state?.changed ? 'changed' : 'unverified';
-    return { ...result, content: [{ type: 'text', text: `> C/C++ include environment is ${reason}; graph relationships may be stale. Run codegraph sync and check status before trusting dependency or flow results.\n\n${head.text}` }, ...tail] };
+    const notice = state?.observed && state.inputsVerified === true && !state.changed
+      ? '> C/C++ tracked inputs verified; include coverage incomplete. Graph relationships may be missing or incorrectly resolved.'
+      : `> C/C++ include environment is ${reason}; graph relationships may be stale. Run codegraph sync and check status before trusting dependency or flow results.`;
+    return { ...result, content: [{ type: 'text', text: `${notice}\n\n${head.text}` }, ...tail] };
   }
 
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
@@ -8168,7 +8171,11 @@ export class ToolHandler {
     const changes = await measurePendingChanges(cg.getProjectRoot());
     if (cg.hasCppIncludeFiles?.()) {
       const environment = await measureCppIncludeEnvironment(cg.getProjectRoot());
-      lines.push(`**C/C++ include environment:** ${environment?.observed && environment.complete && !environment.changed ? 'verified' : environment?.changed ? 'changed (run codegraph sync)' : 'unverified (do not assume the index is current)'}`);
+      const inputsVerified = environment?.observed && environment.inputsVerified === true && !environment.changed;
+      lines.push(`**C/C++ include environment:** ${inputsVerified && !environment.complete
+        ? 'tracked inputs verified; include coverage incomplete (relationships may be missing or incorrectly resolved)'
+        : environment?.observed && environment.complete && !environment.changed && environment.inputsVerified !== false
+          ? 'verified' : environment?.changed ? 'changed (run codegraph sync)' : 'unverified (do not assume the index is current)'}`);
     }
     lines.push(
       `**Latest file indexed:** ${lastIndexedAt == null ? 'never' : new Date(lastIndexedAt).toISOString()}`,

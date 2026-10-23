@@ -59,6 +59,46 @@ const FILE_IO_BATCH_SIZE = 10;
  */
 const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
 
+/** Absence is the only filesystem error that proves a path may be removed. */
+function isMissingPath(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/** Git's explicit non-repository result is safe to scan as a plain directory. */
+function isNotGitRepository(error: unknown): boolean {
+  const failure = error as { status?: number; signal?: string | null; killed?: boolean; stdout?: unknown; stderr?: unknown };
+  return failure.status === 128 && !failure.signal && !failure.killed &&
+    String(failure.stdout ?? '').trim() === '' &&
+    /^fatal: not a git repository(?:[ (:]|$)/i.test(String(failure.stderr ?? '').trim());
+}
+
+class IncompleteScanError extends Error {
+  constructor(operation: string, target: string, cause: unknown) {
+    super(`Incomplete source scan: could not ${operation} ${target}: ${cause instanceof Error ? cause.message : String(cause)}. The existing index was preserved; retry after restoring access.`, { cause });
+    this.name = 'IncompleteScanError';
+  }
+}
+
+function scanFileStat(filePath: string): fs.Stats | null {
+  try {
+    return fs.statSync(filePath);
+  } catch (error) {
+    if (isMissingPath(error)) return null;
+    throw new IncompleteScanError('stat', filePath, error);
+  }
+}
+
+/** Rule readers may tolerate malformed text, but an I/O failure is not empty scope. */
+function readScopeFile(filePath: string): Buffer | null {
+  try {
+    return fs.readFileSync(filePath);
+  } catch (error) {
+    if (isMissingPath(error)) return null;
+    throw new IncompleteScanError('read scope rules', filePath, error);
+  }
+}
+
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
 /**
@@ -407,12 +447,8 @@ function isValidUtf8(buf: Buffer): boolean {
  * Returns '' when there's nothing usable.
  */
 function readGitignorePatterns(giPath: string): string {
-  let buf: Buffer;
-  try {
-    buf = fs.readFileSync(giPath);
-  } catch {
-    return ''; // unreadable (permissions / race) — treat as absent
-  }
+  const buf = readScopeFile(giPath);
+  if (buf === null) return '';
   // A NUL byte never appears in real gitignore text, and a fatal UTF-8 decode
   // catches the rest. Such a file isn't ignore patterns at all.
   if (buf.includes(0) || !isValidUtf8(buf)) {
@@ -457,19 +493,16 @@ function readGitignorePatterns(giPath: string): string {
  */
 function resolveGitDir(repoRoot: string): string | null {
   const gitPath = path.join(repoRoot, '.git');
-  let st: fs.Stats;
-  try {
-    st = fs.statSync(gitPath);
-  } catch {
-    return null;
-  }
+  const st = scanFileStat(gitPath);
+  if (!st) return null;
   if (st.isDirectory()) return gitPath;
   if (!st.isFile()) return null;
   try {
-    const raw = fs.readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    const raw = readScopeFile(gitPath)?.toString('utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
     if (!raw) return null;
     return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(repoRoot, raw);
-  } catch {
+  } catch (error) {
+    if (error instanceof IncompleteScanError) throw error;
     return null;
   }
 }
@@ -493,26 +526,30 @@ function readGitExcludeExtraPatterns(rootDir: string): string {
   const gitDir = resolveGitDir(rootDir);
   if (gitDir) {
     const excludePath = path.join(gitDir, 'info', 'exclude');
-    if (fs.existsSync(excludePath)) {
-      const patterns = readGitignorePatterns(excludePath);
-      if (patterns) chunks.push(patterns);
-    }
+    const patterns = readGitignorePatterns(excludePath);
+    if (patterns) chunks.push(patterns);
   }
   try {
     const configured = execFileSync(
       'git',
       ['-C', rootDir, 'config', '--get', 'core.excludesFile'],
-      { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
     ).trim();
     if (configured) {
       const abs = expandUserPath(configured);
-      if (fs.existsSync(abs)) {
-        const patterns = readGitignorePatterns(abs);
-        if (patterns) chunks.push(patterns);
-      }
+      const patterns = readGitignorePatterns(abs);
+      if (patterns) chunks.push(patterns);
     }
-  } catch {
-    // No git, unset, or timeout — leave extras empty.
+  } catch (error) {
+    if (error instanceof IncompleteScanError) throw error;
+    const failure = error as { status?: number; signal?: string | null; killed?: boolean; stdout?: unknown; stderr?: unknown };
+    // `git config --get` reports a normally unset key with status 1 and no
+    // output, including outside a Git worktree. Other failures leave scope
+    // unknown: a timeout or missing Git must not erase a global negation.
+    if (failure.status !== 1 || failure.signal || failure.killed ||
+      String(failure.stdout ?? '').trim() !== '' || String(failure.stderr ?? '').trim() !== '') {
+      throw new IncompleteScanError('query Git core.excludesFile rules in', rootDir, error);
+    }
   }
   return chunks.join('\n');
 }
@@ -532,7 +569,7 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
         encoding: 'utf8',
         timeout: 60_000,
         maxBuffer: 50 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       },
     );
@@ -542,8 +579,9 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
       dirs.push(entry.endsWith('/') ? entry : `${entry}/`);
     }
     return dirs;
-  } catch {
-    return [];
+  } catch (error) {
+    if (isNotGitRepository(error)) return [];
+    throw new IncompleteScanError('list Git-ignored directories in', rootDir, error);
   }
 }
 
@@ -561,11 +599,9 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
   const projectRules = ignore();
   const rootGitignore = path.join(rootDir, '.gitignore');
-  if (fs.existsSync(rootGitignore)) {
-    const patterns = readGitignorePatterns(rootGitignore);
-    ig.add(patterns);
-    projectRules.add(patterns);
-  }
+  const patterns = readGitignorePatterns(rootGitignore);
+  ig.add(patterns);
+  projectRules.add(patterns);
   const extra = readGitExcludeExtraPatterns(rootDir);
   if (extra) {
     ig.add(extra);
@@ -716,8 +752,9 @@ function collectIncludedFiles(
     let realDir: string;
     try {
       realDir = fs.realpathSync(absDir);
-    } catch {
-      return;
+    } catch (error) {
+      if (isMissingPath(error)) return; // optional include root was removed
+      throw new IncompleteScanError('resolve directory', absDir, error);
     }
     if (visited.has(realDir)) return; // symlink-cycle guard
     visited.add(realDir);
@@ -725,8 +762,9 @@ function collectIncludedFiles(
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(absDir, { withFileTypes: true });
-    } catch {
-      return;
+    } catch (error) {
+      if (isMissingPath(error)) return;
+      throw new IncompleteScanError('read directory', absDir, error);
     }
     for (const entry of entries) {
       if (entry.name === '.git' || isCodeGraphDataDir(entry.name)) continue;
@@ -737,8 +775,9 @@ function collectIncludedFiles(
         try {
           const st = fs.statSync(fs.realpathSync(abs));
           consider(abs, rel, st.isDirectory());
-        } catch {
-          // broken symlink — skip
+        } catch (error) {
+          if (!isMissingPath(error)) throw new IncompleteScanError('resolve symlink', abs, error);
+          // A confirmed broken symlink has no source to index.
         }
         continue;
       }
@@ -807,8 +846,10 @@ function listIgnoredDirs(repoDir: string): string[] {
       { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
     return out.split('\0').filter((e) => e.endsWith('/') && !isWholeCwdEntry(e));
-  } catch {
-    return [];
+  } catch (error) {
+    // Every caller has already confirmed this repository. Returning an empty
+    // list would erase embedded-repo opt-ins from the full or scoped manifest.
+    throw new IncompleteScanError('list Git-ignored directories in', repoDir, error);
   }
 }
 
@@ -833,25 +874,20 @@ const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
  * Returns `'none'` when there is no `.git` entry here.
  */
 function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
-  let st: fs.Stats;
-  try {
-    st = fs.statSync(path.join(absDir, '.git'));
-  } catch {
-    return 'none';
-  }
+  const gitEntry = path.join(absDir, '.git');
+  const st = scanFileStat(gitEntry);
+  if (!st) return 'none';
   if (st.isDirectory()) return 'embedded';
   if (!st.isFile()) return 'none';
-  try {
-    const gitdir = fs.readFileSync(path.join(absDir, '.git'), 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
-    // A worktree's gitdir lives under some repo's `.git/worktrees/<name>` —
-    // either the top-level repo's (`.git/worktrees/`) or, for a worktree of a
-    // submodule, that submodule's gitdir (`.git/modules/<module>/worktrees/`).
-    // The optional `modules/<module>` segment covers the submodule case (#945).
-    // Match both separators so a Windows-style pointer is recognized too.
-    if (gitdir && /(^|[\\/])\.git[\\/](modules[\\/][^\\/]+[\\/])?worktrees[\\/]/.test(gitdir)) return 'worktree';
-  } catch {
-    // Unreadable `.git` pointer — fall back to the prior "index it" behavior.
-  }
+  const pointer = readScopeFile(gitEntry);
+  if (!pointer) return 'none';
+  const gitdir = pointer.toString('utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+  // A worktree's gitdir lives under some repo's `.git/worktrees/<name>` —
+  // either the top-level repo's (`.git/worktrees/`) or, for a worktree of a
+  // submodule, that submodule's gitdir (`.git/modules/<module>/worktrees/`).
+  // The optional `modules/<module>` segment covers the submodule case (#945).
+  // Match both separators so a Windows-style pointer is recognized too.
+  if (gitdir && /(^|[\\/])\.git[\\/](modules[\\/][^\\/]+[\\/])?worktrees[\\/]/.test(gitdir)) return 'worktree';
   return 'embedded';
 }
 
@@ -887,8 +923,9 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(abs, { withFileTypes: true });
-    } catch {
-      continue;
+    } catch (error) {
+      if (isMissingPath(error)) continue;
+      throw new IncompleteScanError('read embedded-repository directory', abs, error);
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
@@ -1101,8 +1138,9 @@ function gitlinkEmbeddedRepoSkipped(
 export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
   try {
     execFileSync('git', ['rev-parse', '--git-dir'], { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-  } catch {
-    return [];
+  } catch (error) {
+    if (isNotGitRepository(error)) return [];
+    throw new IncompleteScanError('identify Git repository in', rootDir, error);
   }
   const out: string[] = [];
   const defaults = defaultsOnlyIgnore();
@@ -1120,7 +1158,10 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
           candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e));
         }
       }
-    } catch { /* untracked listing failed — ignored-side discovery still runs */ }
+    } catch (error) {
+      if (error instanceof IncompleteScanError) throw error;
+      throw new IncompleteScanError('list untracked Git directories in', repoAbs, error);
+    }
     // Unexpanded gitlinks (mode 160000) with a real checkout on disk — embedded
     // repos `git add`ed without `.gitmodules`, or submodules not active here. The
     // untracked listing above can't see them (they're tracked), so find them the
@@ -1142,7 +1183,10 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         if (gitlinkEmbeddedRepoSkipped(relDir, prefix, defaults, repoIgnore, includeIgnored)) continue;
         if (classifyGitDir(path.join(repoAbs, rel)) === 'embedded') candidates.push(relDir);
       }
-    } catch { /* staged listing failed — other discovery still runs */ }
+    } catch (error) {
+      if (error instanceof ConfigError || error instanceof IncompleteScanError) throw error;
+      throw new IncompleteScanError('list staged Git files in', repoAbs, error);
+    }
     candidates.push(...findIgnoredEmbeddedRepos(repoAbs, includeIgnored, prefix));
     for (const rel of candidates) {
       const full = normalizePath(prefix + rel);
@@ -1385,10 +1429,12 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
 /**
  * Get all files visible to git (tracked + untracked but not ignored).
  * Respects .gitignore at all levels (root, subdirectories) and descends into
- * embedded (nested, non-submodule) git repos. Returns null on failure
- * (non-git project) so callers can fall back to a filesystem walk.
+ * embedded (nested, non-submodule) git repos. Only a confirmed non-git or
+ * parent-ignored project falls back to a filesystem walk: the walk cannot
+ * reproduce Git's embedded-repository and includeIgnored semantics.
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
+  let confirmedGit = false;
   try {
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
@@ -1398,6 +1444,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
       ['rev-parse', '--show-toplevel'],
       { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     ).trim();
+    confirmedGit = true;
 
     if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
       try {
@@ -1413,8 +1460,13 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
           gitRoot,
         });
         return null;
-      } catch {
-        // Not ignored — safe to use git ls-files
+      } catch (error) {
+        const failure = error as { status?: number; signal?: string | null; killed?: boolean; stdout?: unknown; stderr?: unknown };
+        // Only the normal no-match result proves the parent did not ignore it.
+        if (failure.status !== 1 || failure.signal || failure.killed ||
+          String(failure.stdout ?? '').trim() !== '' || String(failure.stderr ?? '').trim() !== '') {
+          throw new IncompleteScanError('check Git ignored project root', rootDir, error);
+        }
       }
     }
 
@@ -1437,21 +1489,9 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
     return visible;
   } catch (error) {
-    if (error instanceof ConfigError) throw error;
-    // Any failure here (git missing, a `git rev-parse`/`ls-files` timeout or
-    // buffer overrun under load, an unreadable repo, unsupported flag combo on
-    // older git, etc.) silently sent every caller to `scanDirectoryWalk` with
-    // zero signal that the fast git-delegated path was skipped — making reports
-    // like #1567 (nested-`.gitignore`-excluded `node_modules` walked into)
-    // hard to triage, since both ignore implementations look correct in
-    // isolation but there was no way to tell which one ran. Log it under the
-    // existing CODEGRAPH_DEBUG gate so a future report can confirm or rule out
-    // the fallback in one step.
-    logDebug('git-based file listing unavailable — falling back to filesystem walk', {
-      rootDir,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return null;
+    if (error instanceof ConfigError || error instanceof IncompleteScanError) throw error;
+    if (!confirmedGit && isNotGitRepository(error)) return null;
+    throw new IncompleteScanError('enumerate Git source files in', rootDir, error);
   }
 }
 
@@ -1497,7 +1537,8 @@ export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null)
     const isSource = (filePath: string): boolean => isSourceFile(filePath, overrides, rootDir);
     collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
     return changes;
-  } catch {
+  } catch (error) {
+    if (error instanceof ConfigError || error instanceof IncompleteScanError) throw error;
     return null;
   }
 }
@@ -1722,6 +1763,15 @@ export interface ScanSkipStats {
   unsupportedByExtension: Map<string, number>;
 }
 
+/** One validated observation, reused after the facade starts its write phase. */
+export interface PreparedFileScan {
+  files: string[];
+  fileStats: Map<string, Pick<fs.Stats, 'size' | 'mtimeMs'>>;
+  skipStats: ScanSkipStats;
+  filesChecked: number;
+  gitState: { head: string; stamp: string; dirty: string[] | null };
+}
+
 /** Record one file the scan declined to index. */
 function tallySkip(stats: ScanSkipStats | undefined, rel: string): void {
   if (!stats) return;
@@ -1786,7 +1836,6 @@ function scanDirectoryWalk(
 
   const loadIgnore = (dir: string): ScopedIgnore | null => {
     const giPath = path.join(dir, '.gitignore');
-    if (!fs.existsSync(giPath)) return null;
     // readGitignorePatterns is defensive: a non-UTF-8 (DLP-encrypted) or
     // uncompilable .gitignore is skipped/filtered with a warning, never thrown
     // (issue #682) — so the per-file `.ignores()` calls below can't crash.
@@ -1808,9 +1857,8 @@ function scanDirectoryWalk(
     let realDir: string;
     try {
       realDir = fs.realpathSync(dir);
-    } catch {
-      logDebug('Skipping unresolvable directory', { dir });
-      return;
+    } catch (error) {
+      throw new IncompleteScanError('resolve directory', dir, error);
     }
 
     if (visitedDirs.has(realDir)) {
@@ -1829,8 +1877,7 @@ function scanDirectoryWalk(
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (error) {
-      logDebug('Skipping unreadable directory', { dir, error: String(error) });
-      return;
+      throw new IncompleteScanError('read directory', dir, error);
     }
 
     for (const entry of entries) {
@@ -1860,7 +1907,8 @@ function scanDirectoryWalk(
               }
             }
           }
-        } catch {
+        } catch (error) {
+          if (!isMissingPath(error)) throw new IncompleteScanError('resolve symlink', fullPath, error);
           logDebug('Skipping broken symlink', { path: fullPath });
         }
         continue;
@@ -1998,6 +2046,50 @@ export class ExtractionOrchestrator {
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.queries = queries;
+  }
+
+  /**
+   * Validate discovery and every existence decision before the facade changes
+   * freshness, journal mode, or graph data. Inaccessible is never absent.
+   */
+  async prepareScan(onProgress?: (progress: IndexProgress) => void, scopedPaths?: string[]): Promise<PreparedFileScan> {
+    const skipStats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const scoped = scopedPaths && scopedPaths.length > 0 ? [...new Set(scopedPaths)] : undefined;
+    // Validate even cached config inputs before another reader can silently
+    // memoize a transient read failure as the zero-config default.
+    for (const file of [PROJECT_CONFIG_FILENAME, '.gitignore', getIndexingConfigPath(this.rootDir)]) {
+      const fullPath = path.isAbsolute(file) ? file : path.join(this.rootDir, file);
+      scanFileStat(fullPath);
+      readScopeFile(fullPath);
+    }
+    const gitState = this.captureGitIndexState(!scoped);
+    if (!scoped) this.scopedMatcher = null;
+    onProgress?.({ phase: 'scanning', current: 0, total: 0 });
+    const scope = scoped ? this.scopedSyncMatcher() : undefined;
+    const overrides = scoped ? loadExtensionOverrides(this.rootDir) : undefined;
+    const candidates = scoped
+      ? scoped.filter(file => isSourceFile(file, overrides, this.rootDir) && !scope!.ignores(file))
+      : await scanDirectoryAsync(this.rootDir, (current, currentFile) => {
+        onProgress?.({ phase: 'scanning', current, total: 0, currentFile });
+      }, skipStats);
+    const fileStats = new Map<string, Pick<fs.Stats, 'size' | 'mtimeMs'>>();
+    let checked = 0;
+    for (const file of candidates) {
+      const stat = scanFileStat(path.join(this.rootDir, file));
+      if (stat?.isFile()) fileStats.set(file, { size: stat.size, mtimeMs: stat.mtimeMs });
+      if (++checked % SYNC_RECONCILE_YIELD_INTERVAL === 0) await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (!scoped) {
+      // An omitted tracked path is either genuinely gone or outside the
+      // completed scan's scope. Stat it before accepting either decision:
+      // EACCES/EPERM/EIO must abort the whole batch, including unrelated edits.
+      for (const file of this.queries.getAllFilePaths()) {
+        if (!fileStats.has(file)) scanFileStat(path.join(this.rootDir, file));
+        if (++checked % SYNC_RECONCILE_YIELD_INTERVAL === 0) await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    }
+    const files = [...fileStats.keys()];
+    return { files, fileStats, skipStats, filesChecked: scoped ? scoped.length : files.length, gitState };
   }
 
   /**
@@ -2197,7 +2289,8 @@ export class ExtractionOrchestrator {
     // passed for a COMPLETELY fresh database, where the main thread performs
     // no reads/writes during the parse loop, so one writer applying bundles
     // in file order preserves the #1015 determinism exactly.
-    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null
+    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null,
+    preparedScan?: PreparedFileScan
   ): Promise<IndexResult> {
     const tGrammar = Date.now();
     await initGrammars();
@@ -2230,15 +2323,7 @@ export class ExtractionOrchestrator {
     // early-run 5-10s single stalls were observed on 95k-file repos but never
     // attributed — these labels settle scan vs framework-detect vs grammars.
     const tScan = Date.now();
-    const skipStats: ScanSkipStats = { unsupportedByExtension: new Map() };
-    const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
-      onProgress?.({
-        phase: 'scanning',
-        current,
-        total: 0,
-        currentFile: file,
-      });
-    }, skipStats);
+    const { files, skipStats } = preparedScan ?? await this.prepareScan(onProgress);
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
     /** Only meaningful when nothing was indexable — see IndexResult (#1502). */
     const skipSummary = (): Pick<IndexResult, 'filesSkippedUnsupported' | 'topUnsupportedExtensions'> => {
@@ -3536,7 +3621,8 @@ export class ExtractionOrchestrator {
     /** Inspect changed inputs before deletion/re-extraction cascades their edges. */
     onFileChange?: (filePath: string, content?: string) => void,
     /** A replaced physical root invalidates the stat shortcut for its logical files. */
-    forceContentCheck?: ReadonlySet<string>
+    forceContentCheck?: ReadonlySet<string>,
+    preparedScan?: PreparedFileScan
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
@@ -3573,7 +3659,9 @@ export class ExtractionOrchestrator {
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
     const tSyncScan = Date.now();
-    let currentFiles: string[];
+    const scan = preparedScan ?? await this.prepareScan(onProgress, scopedPaths);
+    const currentFiles = scan.files;
+    filesChecked = scan.filesChecked;
     let trackedFiles: FileRecord[];
     if (scopedPaths && scopedPaths.length > 0) {
       // Scoped reconcile: stat only the reported paths. filesChecked counts
@@ -3591,14 +3679,6 @@ export class ExtractionOrchestrator {
       // so a tracked one takes the removal branch below, exactly as a full
       // sync would treat it. (`include`-forced paths pass: ScopeIgnore
       // applies the include precedence itself.)
-      const scope = this.scopedSyncMatcher();
-      const overrides = loadExtensionOverrides(this.rootDir);
-      currentFiles = unique.filter(
-        (p) =>
-          isSourceFile(p, overrides, this.rootDir) &&
-          !scope.ignores(p) &&
-          fs.existsSync(path.join(this.rootDir, p))
-      );
       trackedFiles = [];
       for (const p of unique) {
         const rec = this.queries.getFileByPath(p);
@@ -3611,7 +3691,6 @@ export class ExtractionOrchestrator {
       // `.gitignore` / exclude-standard change that forced this full sync is
       // visible to the next scoped sync (#1728).
       this.scopedMatcher = null;
-      currentFiles = await scanDirectoryAsync(this.rootDir);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
 
@@ -3629,9 +3708,8 @@ export class ExtractionOrchestrator {
       trackedMap.set(f.path, f);
     }
 
-    // Removals: tracked in the DB but no longer a present source file. Check the
-    // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
-    // file deleted from disk but not yet staged, so set membership alone misses it.
+    // Removals use only the validated scan. It already stat-checked Git's
+    // potentially stale tracked list and rejected uncertain I/O failures.
     // `reconcileChecks` drives the cooperative yield shared with the adds/mods loop
     // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
     let reconcileChecks = 0;
@@ -3662,7 +3740,7 @@ export class ExtractionOrchestrator {
     };
     const removed: FileRecord[] = [];
     for (const tracked of trackedFiles) {
-      if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+      if (!currentSet.has(tracked.path)) {
         removed.push(tracked);
       }
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
@@ -3708,14 +3786,8 @@ export class ExtractionOrchestrator {
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
       if (tracked && !neverParsed) {
-        try {
-          const stat = fs.statSync(fullPath);
-          if (!forceContentCheck?.has(filePath) && stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
-            continue;
-          }
-        } catch (error) {
-          logDebug('Skipping unstattable file during sync', { filePath, error: String(error) });
-          failedFilePaths.push(filePath);
+        const stat = scan.fileStats.get(filePath)!;
+        if (!forceContentCheck?.has(filePath) && stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
           continue;
         }
       }
@@ -3832,8 +3904,8 @@ export class ExtractionOrchestrator {
     } catch { return null; }
   }
 
-  /** Capture before file reads. In-flight/failed full writes must not claim freshness. */
-  beginGitIndexState(full: boolean): { head: string; stamp: string; dirty: string[] | null } {
+  /** Observe the commit before any file stat can be reused by reconciliation. */
+  private captureGitIndexState(full: boolean): PreparedFileScan['gitState'] {
     const head = getGitHeadSha(this.rootDir) ?? '';
     const stamp = this.queries.getMetadata(INDEXED_AT_COMMIT_KEY) ?? '';
     const prior = this.indexedDirtyPaths(stamp);
@@ -3841,6 +3913,13 @@ export class ExtractionOrchestrator {
     const dirty = status ? [...new Set([
       ...(full ? [] : prior ?? []), ...status.added, ...status.modified, ...status.deleted,
     ])] : null;
+    return { head, stamp, dirty };
+  }
+
+  /** Invalidate freshness only after discovery succeeded, using its original commit. */
+  beginGitIndexState(full: boolean, snapshot = this.captureGitIndexState(full)): PreparedFileScan['gitState'] {
+    const { stamp, dirty } = snapshot;
+    const prior = this.indexedDirtyPaths(stamp);
     if (full || prior === null || dirty === null) {
       this.queries.setMetadata(INDEXED_AT_COMMIT_KEY, '');
       this.queries.setMetadata('indexed_dirty_paths', '');
@@ -3849,7 +3928,7 @@ export class ExtractionOrchestrator {
       // first write, so a crash cannot forget an indexed uncommitted edit.
       this.queries.setMetadata('indexed_dirty_paths', JSON.stringify({ commit: stamp, paths: dirty }));
     }
-    return { head, stamp, dirty };
+    return snapshot;
   }
 
   finishGitIndexState(snapshot: { head: string; stamp: string; dirty: string[] | null }, full: boolean, retries: string[] = []): void {

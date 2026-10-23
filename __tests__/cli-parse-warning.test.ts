@@ -42,7 +42,7 @@ describe('CLI parse warnings (#1522)', () => {
     return { status: result.status, out: (result.stdout ?? '') + (result.stderr ?? '') };
   }
 
-  it('shows a collapsed parse without failing, then stays quiet after a healthy re-index', () => {
+  it('shows a collapsed parse without failing, then stays quiet after a healthy update', () => {
     const sourcePath = path.join(root, 'min.cpp');
     fs.writeFileSync(sourcePath, SOURCE);
 
@@ -52,7 +52,7 @@ describe('CLI parse warnings (#1522)', () => {
     expect(collapsed.out).toContain(`min.cpp: ${COLLAPSE_WARNING}`);
 
     fs.writeFileSync(sourcePath, SOURCE.replaceAll('FILE_TEMPLATE_V1', 'FILE_TEMPLATE_V'));
-    const healthy = run(['index']);
+    const healthy = run(['sync']);
     expect(healthy.status, healthy.out).toBe(0);
     expect(healthy.out).not.toContain(COLLAPSE_WARNING);
 

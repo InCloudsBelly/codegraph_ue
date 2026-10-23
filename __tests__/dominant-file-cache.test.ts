@@ -15,7 +15,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src';
 import { QueryBuilder } from '../src/db/queries';
-import { DatabaseConnection, getDatabasePath } from '../src/db';
+import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from '../src/db';
 
 /** A file whose functions call each other in a chain: `n` in-file call edges. */
 function chain(prefix: string, n: number): string {
@@ -132,7 +132,9 @@ describe('dominant file — computed once per index state (#1864)', () => {
     const reader = await setup();
     expect(queriesOf(reader).getDominantFile()?.filePath).toBe('core/engine.ts');
     fs.writeFileSync(path.join(dir, 'ext', 'plugin.ts'), chain('pluginStep', 120));
-    const rebuilt = await CodeGraph.recreate(dir);
+    // Explicit replacement is fixture setup, never a production rebuild path.
+    removeDatabaseFiles(getDatabasePath(dir));
+    const rebuilt = CodeGraph.initSync(dir);
     try { await rebuilt.indexAll(); } finally { rebuilt.close(); }
     expect(reader.reopenIfReplaced()).toBe(true);
     expect(queriesOf(reader).getDominantFile()?.filePath).toBe('ext/plugin.ts');

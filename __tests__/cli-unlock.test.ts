@@ -46,7 +46,7 @@ describe('codegraph unlock — daemon artifact recovery (#1553)', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('removes indexing and phantom-daemon artifacts, then permits indexing', () => {
+  it('removes indexing and phantom-daemon artifacts, then permits sync', () => {
     const graphDir = path.join(tempDir, '.codegraph');
     const pidPath = getDaemonPidPath(tempDir);
     const socketPath = getDaemonSocketPath(tempDir);
@@ -66,7 +66,7 @@ describe('codegraph unlock — daemon artifact recovery (#1553)', () => {
     expect(fs.existsSync(pidPath)).toBe(false);
     if (process.platform !== 'win32') expect(fs.existsSync(socketPath)).toBe(false);
     expect(() => process.kill(process.pid, 0)).not.toThrow();
-    expect(() => runCodegraph(['index', '--quiet', tempDir], tempDir)).not.toThrow();
+    expect(() => runCodegraph(['sync', '--quiet', tempDir], tempDir)).not.toThrow();
   });
 
   it('preserves artifacts when the recorded live daemon answers the socket hello', async () => {

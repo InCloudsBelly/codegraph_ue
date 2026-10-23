@@ -53,9 +53,10 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
     clearProjectConfigCache();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     clearProjectConfigCache();
-    fs.rmSync(ws, { recursive: true, force: true });
+    // Let Windows release handles from Git children before retrying removal.
+    await fs.promises.rm(ws, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
 
   /** Drop a `codegraph.json` at the workspace root. */

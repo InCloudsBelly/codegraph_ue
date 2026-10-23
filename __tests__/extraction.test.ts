@@ -8948,7 +8948,7 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('scratch/tmp.ts')).toBe(true);
   });
 
-  it('filesystem fallback retains git info/exclude and core.excludesFile when ls-files fails (#1959)', async () => {
+  it('refuses incomplete Git enumeration and retains exclude rules after recovery (#1959)', async () => {
     const { execFileSync } = await import('child_process');
     const root = path.join(tempDir, 'fallback-excludes-root');
     fs.mkdirSync(root, { recursive: true });
@@ -8963,10 +8963,13 @@ describe('Nested non-submodule git repos', () => {
     fs.writeFileSync(path.join(root, 'scratch', 'hidden.ts'), 'export const hidden = 1;\n');
     fs.writeFileSync(path.join(root, 'worktrees', 'hidden.ts'), 'export const hidden = 2;\n');
 
-    // rev-parse/config still work, but both ls-files and status fail as they
-    // would under a Git timeout. This exercises the real filesystem walk.
+    // rev-parse/config still work, but the listing is incomplete. A filesystem
+    // fallback cannot reproduce embedded-repo opt-ins, so reject the manifest.
     fs.writeFileSync(path.join(root, '.git', 'index'), 'not a git index');
     expect(() => execFileSync('git', ['ls-files'], { cwd: root, stdio: 'pipe' })).toThrow();
+    expect(() => scanDirectory(root)).toThrow(/Git/);
+    await expect(scanDirectoryAsync(root)).rejects.toThrow(/Git/);
+    fs.unlinkSync(path.join(root, '.git', 'index'));
     expect(scanDirectory(root)).toEqual(['app.ts']);
     expect(await scanDirectoryAsync(root)).toEqual(['app.ts']);
   });

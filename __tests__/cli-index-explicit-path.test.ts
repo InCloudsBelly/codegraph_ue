@@ -57,8 +57,14 @@ describe('codegraph index <path> (#1524)', () => {
     expect(fs.existsSync(path.join(child, '.codegraph'))).toBe(false);
   });
 
-  it('rebuilds the explicit path when it is initialized, and a bare `index` still resolves upward from a subdirectory', () => {
-    expect(run(root, ['index', parent, '--quiet']).status).toBe(0);
-    expect(run(child, ['index', '--quiet']).status).toBe(0);
+  it('protects the explicit initialized path and its ancestor from a bare invocation', () => {
+    const dbPath = path.join(parent, '.codegraph', 'codegraph.db');
+    const before = fs.readFileSync(dbPath);
+    for (const result of [run(root, ['index', parent, '--quiet']), run(child, ['index', '--quiet'])]) {
+      expect(result.status).toBe(1);
+      expect(result.out).toContain('preserving existing index');
+      expect(result.out).toContain(parent);
+    }
+    expect(fs.readFileSync(dbPath).equals(before)).toBe(true);
   });
 });

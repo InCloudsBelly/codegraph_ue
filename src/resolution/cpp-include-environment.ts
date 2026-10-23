@@ -47,18 +47,33 @@ function identity(root: string, file: string, kind: Dependency['kind'], previous
     }
     if (kind === 'directory') return `${real}\0${stat.dev}:${stat.ino}:${digest(fs.readdirSync(full).filter(f => /\.uplugin$/i.test(f)).sort().join('\0'))}`;
     return `${real}\0${stat.dev}:${stat.ino}:${stat.isFile() ? 'file' : 'directory'}`;
-  } catch { return 'missing'; }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'missing' : `unreadable:${code ?? 'unknown'}`;
+  }
+}
+
+function verifiableIdentity(value: string, kind: Dependency['kind']): boolean {
+  if (value === 'missing') return true;
+  if (kind === 'content') return /\0[0-9a-f]{64}$/.test(value);
+  if (kind === 'directory') return /\0\d+:\d+:[0-9a-f]{64}$/.test(value);
+  return /\0\d+:\d+:(?:file|directory)$/.test(value);
 }
 
 export function checkCppIncludeSnapshot(root: string, raw: string | null): {
-  observed: boolean; complete: boolean; changed: boolean; affectedFiles: string[]; physicalRootsChanged?: boolean; reason?: string;
+  observed: boolean; complete: boolean; inputsVerified: boolean; changed: boolean; affectedFiles: string[]; physicalRootsChanged?: boolean; reason?: string;
 } {
   try {
     const snapshot = JSON.parse(raw ?? 'null') as CppIncludeSnapshot | null;
-    if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.dependencies) || !Array.isArray(snapshot.files) ||
+    if (!snapshot || snapshot.version !== 1 || typeof snapshot.complete !== 'boolean' ||
+      snapshot.bounded !== undefined && typeof snapshot.bounded !== 'boolean' ||
+      !Array.isArray(snapshot.dependencies) || !Array.isArray(snapshot.files) ||
       snapshot.dependencies.length > MAX_DEPENDENCIES || snapshot.files.some(f => typeof f !== 'string')) throw new Error('unobserved');
     const affected = new Set<string>();
     let changed = snapshot.bounded === false;
+    // Coverage can be incomplete despite stable, fully verified inputs. An
+    // empty observation set provides no evidence for that separate claim.
+    let inputsVerified = snapshot.bounded !== false && snapshot.dependencies.length > 0;
     let ownerCount = 0;
     if (snapshot.bounded === false) for (const file of snapshot.files) affected.add(file);
     let physicalRootsChanged = false;
@@ -68,16 +83,17 @@ export function checkCppIncludeSnapshot(root: string, raw: string | null): {
       ownerCount += dep.owners.length;
       if (ownerCount > 500_000) throw new Error('invalid snapshot budget');
       const now = identity(root, dep.path, dep.kind, dep.identity);
+      if (now !== dep.identity || !verifiableIdentity(now, dep.kind)) inputsVerified = false;
       if (now !== dep.identity) {
         changed = true;
         if (dep.kind === 'probe' && (dep.identity.endsWith(':directory') || now.endsWith(':directory'))) physicalRootsChanged = true;
         for (const owner of dep.owners.includes('*') ? snapshot.files : dep.owners) affected.add(owner);
       }
     }
-    return { observed: true, complete: snapshot.complete === true, changed, affectedFiles: [...affected], physicalRootsChanged,
+    return { observed: true, complete: snapshot.complete === true, inputsVerified, changed, affectedFiles: [...affected], physicalRootsChanged,
       ...(snapshot.complete ? {} : { reason: 'include-environment-incomplete' }) };
   } catch {
-    return { observed: false, complete: false, changed: true, affectedFiles: [], reason: 'include-environment-unobserved' };
+    return { observed: false, complete: false, inputsVerified: false, changed: true, affectedFiles: [], reason: 'include-environment-unobserved' };
   }
 }
 
@@ -280,6 +296,11 @@ export class CppIncludeEnvironment {
     }), ...this.moduleObservations.filter(o => o.rules.isModuleRules).map(o => o.filePath)])];
     const indexed = new Set(files);
     if (files.length > 0 && !this.databasePresent && !this.modules?.length) this.complete = false;
+    // A synthesis stage may have discarded its include-resolution cache.
+    // Static rules that cannot establish public/private search roots remain
+    // incomplete even when this resolver has not replayed an include yet.
+    if (!this.databasePresent && this.moduleObservations.some(observation => observation.rules.isModuleRules &&
+      (!observation.rules.publicComplete || !observation.rules.privateComplete))) this.complete = false;
     try {
       const old = JSON.parse(previous ?? 'null') as CppIncludeSnapshot | null;
       if (old?.version === 1 && Array.isArray(old.dependencies) && old.dependencies.length <= MAX_DEPENDENCIES) {

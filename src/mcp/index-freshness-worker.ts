@@ -15,7 +15,7 @@ if (parentPort) {
     cg = CodeGraph.openSync((workerData as { root: string }).root, metadataOnly ? { readOnly: true } : {});
     if (metadataOnly) {
       const status = cg.getCppIncludeEnvironmentStatus();
-      counts = { observed: status.observed, complete: status.complete, changed: status.changed, reason: status.reason };
+      counts = { observed: status.observed, complete: status.complete, inputsVerified: status.inputsVerified, changed: status.changed, reason: status.reason };
     } else {
       const changes = cg.getChangedFiles();
       counts = { added: changes.added.length, modified: changes.modified.length, removed: changes.removed.length };

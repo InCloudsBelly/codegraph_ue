@@ -53,11 +53,11 @@ async function client() {
   expect((await response(server, 2)).result.isError).not.toBe(true);
   return server;
 }
-async function rebuild() {
+async function refusedRebuild() {
   const cmd = start(['index', '--quiet']);
   await until(() => cmd.child.exitCode !== null || cmd.child.signalCode !== null, 60000);
-  expect(cmd.errors()).not.toContain('Failed to index');
-  expect(cmd.child.exitCode).toBe(0);
+  expect(cmd.errors()).toContain('preserving existing index');
+  expect(cmd.child.exitCode).toBe(1);
 }
 beforeEach(async () => {
   root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rebuild-')));
@@ -86,24 +86,26 @@ afterEach(async () => {
     await stopDaemonAt(root, { preserveUnverified: true });
     await new Promise(r => setTimeout(r, 25));
   }
+  // Node 24's synchronous removal can stop at the first Windows access-denied
+  // error during daemon handle rundown; the async path backs off and retries.
+  await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   removeSpawnLog(root);
-  fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }, 90000);
 
-it.runIf(process.platform === 'win32')('rebuilds after the real MCP client closes with SQLite held by its daemon (#1325)', async () => {
+it.runIf(process.platform === 'win32')('refuses raw rebuild while preserving the real daemon and its graph (#1325)', async () => {
   const server = await client();
   const pid = JSON.parse(fs.readFileSync(path.join(root, '.codegraph/daemon.pid'), 'utf8')).pid;
   server.child.stdin.end();
   await until(() => server.child.exitCode !== null);
   expect(isProcessAlive(pid)).toBe(true);
-  await rebuild();
-  expect(isProcessAlive(pid)).toBe(false);
+  await refusedRebuild();
+  expect(isProcessAlive(pid)).toBe(true);
   const cg = CodeGraph.openSync(root);
   try { expect(cg.searchNodes('originalSymbol').length).toBeGreaterThan(0); }
   finally { cg.close(); }
 }, 90000);
 
-it('keeps an active client from reopening SQLite during rebuild and serves the new graph afterward', async () => {
+it('honors an external replacement fence and syncs after a refused raw rebuild', async () => {
   const server = await client();
   // Hold the exact CLI rebuild fence to deterministically exercise a request
   // arriving between daemon termination and database recreation.
@@ -115,7 +117,7 @@ it('keeps an active client from reopening SQLite during rebuild and serves the n
   expect(readWriterLock(root)?.mode).not.toBe('fallback');
   releaseWriterLock(root, 'rebuild.pid');
   fs.writeFileSync(path.join(root, 'app.ts'), 'export function replacementSymbol() {}\n');
-  await rebuild();
+  await refusedRebuild();
   send(server, 4, 'tools/call', { name: 'codegraph_explore', arguments: { query: 'replacementSymbol' } });
   const reply = await response(server, 4);
   expect(reply.error).toBeUndefined();
@@ -130,7 +132,7 @@ it('preserves a foreign writer and the existing database', async () => {
     const cmd = start(['index', '--quiet']);
     await until(() => cmd.child.exitCode !== null);
     expect(cmd.child.exitCode).toBe(1);
-    expect(cmd.errors()).toContain('writer lock held');
+    expect(cmd.errors()).toContain('preserving existing index');
     expect(readWriterLock(root)?.pid).toBe(process.pid);
     expect(fs.readFileSync(path.join(root, '.codegraph/codegraph.db'))).toEqual(before);
   } finally { releaseWriterLock(root); }

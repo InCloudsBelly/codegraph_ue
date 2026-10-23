@@ -1,8 +1,7 @@
 /**
  * Live sync follows a rebuilt index (issue #1902).
  *
- * `codegraph index` rebuilds through `CodeGraph.recreate()`, which unlinks
- * `.codegraph/codegraph.db` and creates a new file (a new inode) at the same
+ * An external replacement of `.codegraph/codegraph.db` creates a new inode at the same
  * path. A long-lived instance — the MCP daemon — keeps its handle on the old,
  * unlinked inode. Before the fix its watcher kept "auto-syncing" into that dead
  * inode (nothing it wrote was visible to any other process), and the #925
@@ -17,13 +16,19 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import CodeGraph, { LockUnavailableError } from '../src/index';
+import { getDatabasePath, removeDatabaseFiles } from '../src/db';
 import type { MCPEngine } from '../src/mcp/engine';
 
 const posixOnly = it.runIf(process.platform !== 'win32');
 
-/** Rebuild the index in a separate instance, the way `codegraph index` does. */
+/** Explicitly replace a throwaway fixture to simulate an external replacement. */
+function freshFixture(root: string): CodeGraph {
+  removeDatabaseFiles(getDatabasePath(root));
+  return CodeGraph.initSync(root);
+}
+
 async function rebuild(root: string): Promise<void> {
-  const cg = await CodeGraph.recreate(root);
+  const cg = freshFixture(root);
   await cg.indexAll();
   cg.close();
 }
@@ -87,8 +92,8 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     const server = CodeGraph.initSync(root);
     await server.indexAll();
     try {
-      // `codegraph index`: the file is recreated first, the write lock is taken later by indexAll.
-      const rebuilder = await CodeGraph.recreate(root);
+      // A fixture replacement creates the file before indexAll takes its lock.
+      const rebuilder = freshFixture(root);
       fs.appendFileSync(path.join(root, 'src', 'a.ts'), 'export function gamma() { return 3; }\n');
       // The server's sync lands in the gap: it must not claim the lock for a
       // full reconcile of the empty file, and reports contention instead of success.
@@ -131,8 +136,8 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     // must outlast the rebuild below; 200 ms leaves several seconds.
     expect(server.watch({ debounceMs: 200, onSyncComplete: () => { synced++; } })).toBe(true);
     try {
-      // `codegraph index` has recreated the file but not taken the write lock yet.
-      const rebuilder = await CodeGraph.recreate(root);
+      // The fixture file was replaced, but indexAll has not taken its lock yet.
+      const rebuilder = freshFixture(root);
       fs.appendFileSync(path.join(root, 'src', 'a.ts'), 'export function gamma() { return 3; }\n');
       await waitFor(() => attempts.length > 0);
       await expect(attempts[0]).rejects.toBeInstanceOf(LockUnavailableError);

@@ -4719,17 +4719,20 @@ export class QueryBuilder {
    */
   getResolutionEdgesFromFiles(
     language: Language,
-    files: string[]
+    files: string[],
+    kinds?: readonly EdgeKind[]
   ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    if (kinds?.length === 0) return [];
+    const kindFilter = kinds ? `AND e.kind IN (${kinds.map(() => '?').join(',')})` : '';
     const ids: number[] = [];
     for (let i = 0; i < files.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = files.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const rows = this.db
         .prepare(
           `SELECT e.id AS id FROM nodes n CROSS JOIN edges e ON e.source = n.id
-            WHERE n.file_path IN (${chunk.map(() => '?').join(',')})`
+            WHERE n.file_path IN (${chunk.map(() => '?').join(',')}) ${kindFilter}`
         )
-        .all(...chunk) as Array<{ id: number }>;
+        .all(...chunk, ...(kinds ?? [])) as Array<{ id: number }>;
       for (const r of rows) ids.push(r.id);
     }
     return this.loadResolutionEdges(language, ids);

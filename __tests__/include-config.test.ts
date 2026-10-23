@@ -117,9 +117,10 @@ describe('include behavior — scanDirectory force-indexes gitignored source', (
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-include-scan-'));
     clearProjectConfigCache();
   });
-  afterEach(() => {
+  afterEach(async () => {
     clearProjectConfigCache();
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Let Windows release handles from Git children before retrying removal.
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
 
   const gitInit = () => {

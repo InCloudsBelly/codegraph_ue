@@ -216,6 +216,7 @@ export class ResolverPool {
             waiter.reject(err);
           } else {
             this.fail(err);
+            readyReject(err);
           }
         }
       });
@@ -301,6 +302,9 @@ export class ResolverPool {
    * worker failure — the caller retries the pass on the main thread.
    */
   async runSynthPass(passName: string): Promise<SynthPassResult> {
+    // Worker open now prepares grammars needed by controlled metadata readers.
+    // A small project can reach synthesis before that asynchronous boot ends.
+    await this.ready();
     if (this.failed) throw this.failed;
     const id = this.nextId++;
     const pw = this.workers.reduce((a, b) => (b.busy < a.busy ? b : a));

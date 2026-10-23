@@ -688,6 +688,38 @@ export class ReferenceResolver {
     return refreshUnrealModuleGraph(this.queries, this.context, createYielder());
   }
 
+  /** One-time legacy repair: reconsider includes without reopening symbol refs or synthesis. */
+  async repairLegacyUeIncludeImports(): Promise<number> {
+    const anchors = Array.from(this.queries.iterateNodesByKindIn('file', ['c', 'cpp']), node =>
+      ({ id: node.id, filePath: node.filePath, language: node.language }));
+    const onYield = createYielder();
+    let attempted = 0;
+    for (let i = 0; i < anchors.length; i += 128) {
+      const batch = anchors.slice(i, i + 128);
+      const edgeIds: number[] = [];
+      const refs: UnresolvedReference[] = [];
+      for (const language of ['c', 'cpp'] as const) {
+        const files = batch.filter(node => node.language === language).map(node => node.filePath);
+        for (const edge of this.queries.getResolutionEdgesFromFiles(language, files, ['imports'])) {
+          const ref = resurrectRefFromDroppedEdge(edge);
+          if (ref?.referenceKind !== 'imports') continue;
+          edgeIds.push(edge.edgeId); refs.push(ref);
+        }
+      }
+      // The synchronous batch joins one transaction: a failure retains its
+      // prior edges and parked refs instead of leaving an orphan queue that
+      // would make the next sync rerun whole-graph synthesis.
+      attempted += this.queries.runInTransaction(() => {
+        if (edgeIds.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+        const imports = this.queries.getUnresolvedReferencesFromNodes(batch.map(node => node.id), ['imports']);
+        if (imports.length > 0) this.resolveAndPersist(imports);
+        return imports.length;
+      });
+      await onYield();
+    }
+    return attempted;
+  }
+
   getCppIncludeAffectedFiles(files: readonly string[]): string[] {
     this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
     return this.cppIncludeEnvironment.affectedFiles(files);
@@ -695,7 +727,9 @@ export class ReferenceResolver {
 
   getCppIncludeSnapshot(previous?: string | null): import('./cpp-include-environment').CppIncludeSnapshot {
     this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
-    try { if (JSON.parse(previous ?? 'null')?.ueModules === true) this.cppIncludeEnvironment.getUeModuleRules(); } catch { /* Earlier snapshots have no UE module observations. */ }
+    // A fresh synthesis resolver may have been discarded before this stamp,
+    // and older pooled indexes never recorded their module observations.
+    if (this.context.getAllFiles().some(file => /\.Build\.cs$/i.test(file))) this.cppIncludeEnvironment.getUeModuleRules();
     return this.cppIncludeEnvironment.snapshot(previous);
   }
 

@@ -559,7 +559,7 @@ codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents AND the CLI (--keep-cli for configs only)
 codegraph init [path]             # Initialize a project + build its graph (one step)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
-codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
+codegraph index [path]            # Refuses destructive replacement of an existing index
 codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
@@ -577,6 +577,14 @@ codegraph upgrade [version]       # Update to the latest release (--check, --for
 codegraph version                 # Print the installed version (also -v, --version)
 codegraph help [command]          # Show help, optionally for one command
 ```
+
+Existing indexes are preserved: `codegraph index` and SDK `recreate()` refuse to discard them,
+including empty, unreadable, or unrecognized database artifacts. Use `codegraph sync` for updates.
+For a fresh rebuild, set `CODEGRAPH_DIR` to an independent empty directory name such as
+`.codegraph-candidate`, run `codegraph init`, and validate the candidate before switching to it;
+retain the original index as a backup. `--force` does not bypass this preservation rule.
+If Git file enumeration, configuration, or scope rules cannot be read, the existing index is preserved;
+restore access to Git and those files, then retry.
 
 ### `codegraph affected`
 
@@ -761,7 +769,7 @@ defaults and win on conflict, so you can also re-point a built-in (e.g.
 `".h": "cpp"`). Commit the file to share the mapping with your team. A typo'd
 language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
-Re-index (`codegraph index`) after adding or changing mappings.
+After adding or changing mappings, build and validate an independent candidate index using the preservation steps above.
 
 ## Telemetry
 

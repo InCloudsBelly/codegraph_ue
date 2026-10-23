@@ -98,8 +98,8 @@ describe('CLI color handling (#1281)', () => {
     expect(out).toContain('alpha');
   });
 
-  it('piped `codegraph index` emits plain per-phase lines: no ANSI, no \\r rewrites', () => {
-    const out = run(['index'], colorEnv(), tempDir);
+  it('piped candidate initialization emits plain per-phase lines: no ANSI, no \\r rewrites', () => {
+    const out = run(['init', '--yes'], colorEnv({ CODEGRAPH_DIR: '.codegraph-color-candidate' }), tempDir);
     expect(out).not.toMatch(ANSI);
     expect(out).not.toContain('\r');
   }, 60000);

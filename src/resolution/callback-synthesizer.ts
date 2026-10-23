@@ -5352,6 +5352,13 @@ export async function synthesizeCallbackEdges(
   if (pool && gatedIn.length > 1) {
     const runPooled = async (i: number): Promise<void> => {
       const pass = SYNTH_PASSES[i]!;
+      // This pass also records controlled build-metadata observations in the
+      // resolver's include environment. Keep those with the main-thread owner
+      // that persists its snapshot; edge-only worker results cannot carry them.
+      if (pass.name === 'unrealModules') {
+        await runPassOnMain(i);
+        return;
+      }
       try {
         const out = await pool.runSynthPass(pass.name);
         passEdges[i] = out.edges;

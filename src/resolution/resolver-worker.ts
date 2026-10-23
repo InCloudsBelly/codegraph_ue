@@ -27,6 +27,7 @@ import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import { collectBeforeExit } from '../worker-teardown';
+import { ensureUeModuleGrammar } from './ue-module-environment';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -47,7 +48,7 @@ type InMessage =
 
 let dbPath: string | null = null;
 
-port.on('message', (msg: InMessage) => {
+port.on('message', async (msg: InMessage) => {
   try {
     switch (msg.type) {
       case 'open': {
@@ -59,6 +60,10 @@ port.on('message', (msg: InMessage) => {
         db.pragma('cache_size = -32000');
         const tDb = Date.now();
         queries = new QueryBuilder(db);
+        // C++ include resolution also reads Build.cs through the controlled
+        // metadata reader. Prepare its AST grammar before any resolver cache
+        // can mistake unavailable parsing for an ordinary C# class.
+        if (queries.getAllFilePaths().some(file => /\.Build\.cs$/i.test(file))) await ensureUeModuleGrammar();
         resolver = new ReferenceResolver(msg.projectRoot, queries);
         resolver.initialize();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);

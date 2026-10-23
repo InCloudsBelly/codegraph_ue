@@ -3,6 +3,7 @@ import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
 import type { UeModuleObservation } from './ue-module-environment';
+import { ensureUeModuleGrammar } from './ue-module-environment';
 
 /** Static build metadata is evidence, never a claim about the selected UBT target. */
 export const UE_MODULE_SYNTHESIZER = 'ue-module';
@@ -12,6 +13,7 @@ type Evidence = Record<string, unknown> & { name: string; kind: string; conditio
 
 /** One edge per file pair: synthesis's merge key must not discard dependency kinds. */
 export async function unrealModuleEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  if (ctx.getAllFiles().some(file => /\.Build\.cs$/i.test(file))) await ensureUeModuleGrammar();
   // Missing the controlled reader means missing evidence, not permission to
   // invent another metadata reader whose inputs sync cannot invalidate.
   const modules: AnchoredModule[] = (ctx.getUeModuleRules?.() ?? []).flatMap(observation => {

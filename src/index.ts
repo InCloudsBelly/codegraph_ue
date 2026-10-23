@@ -28,7 +28,7 @@ import {
   IndexHealth,
   Language,
 } from './types';
-import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
+import { DatabaseConnection, getDatabasePath } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
@@ -37,11 +37,13 @@ import {
   createDirectory,
   removeDirectory,
   validateDirectory,
+  assertNoExistingIndexArtifacts,
 } from './directory';
 import {
   ExtractionOrchestrator,
   IndexProgress,
   IndexResult,
+  PreparedFileScan,
   SyncResult,
   extractFromSource,
   initGrammars,
@@ -70,6 +72,7 @@ import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegmen
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 import { CPP_INCLUDE_SNAPSHOT_KEY, checkCppIncludeSnapshot } from './resolution/cpp-include-environment';
+import { ensureUeModuleGrammar } from './resolution/ue-module-environment';
 
 // Re-export types for consumers
 export * from './types';
@@ -415,51 +418,14 @@ export class CodeGraph {
   }
 
   /**
-   * Rebuild the project's database from scratch and return a fresh, empty
-   * instance — the "same result as a fresh init" semantics that `codegraph
-   * index` documents.
-   *
-   * Unlike `open()` followed by `clear()`, this DISCARDS the existing
-   * `.codegraph/codegraph.db` (and its `-wal`/`-shm` sidecars) before
-   * re-initializing, instead of opening the old database and DELETE-ing every
-   * row. On a large or pre-fix poisoned index — e.g. an old graph that scanned
-   * an ignored gitlink corpus (#1065) into ~1.6M nodes with a multi-GB WAL —
-   * the per-row `nodes_fts` delete-trigger churn blocks the main thread long
-   * enough to trip the #850 liveness watchdog before indexing even starts, so a
-   * full re-index could never recover the bad state (#1067). Discarding the
-   * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
-   * (and running migrations against) the poisoned database entirely.
+   * Destructive recreation is refused while any existing index artifact is
+   * present or inaccessible. Build and validate an independent CODEGRAPH_DIR
+   * candidate, then switch explicitly while retaining the original backup.
    */
   static async recreate(projectRoot: string): Promise<CodeGraph> {
-    await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
-
-    // Check if initialized — recreate REBUILDS an existing project; it is not a
-    // first-time `init`.
-    if (!isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
-    }
-
-    const dbPath = getDatabasePath(resolvedRoot);
-    try {
-      removeDatabaseFiles(dbPath);
-    } catch (err) {
-      // POSIX unlinks an open file fine; this fires mainly on Windows when a
-      // live daemon/MCP server still holds the database. Turn the raw EBUSY into
-      // an actionable instruction instead of a generic failure.
-      const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `Could not rebuild the index — the database file is in use (${reason}). ` +
-          `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
-          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
-      );
-    }
-
-    // Re-create an empty, freshly-schema'd database at the same path.
-    const db = DatabaseConnection.initialize(dbPath);
-    const queries = new QueryBuilder(db.getDb());
-
-    return new CodeGraph(db, queries, resolvedRoot);
+    assertNoExistingIndexArtifacts(resolvedRoot);
+    throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
   }
 
   /**
@@ -543,33 +509,37 @@ export class CodeGraph {
       // 'indexing' and a crashed init is re-run from scratch; existing DBs
       // (re-index/sync) never take this path. Kill switch:
       // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
-      const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
-      const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
-      if (fastInit) {
-        try {
-          this.db.getDb().pragma('journal_mode = MEMORY');
-          this.db.getDb().pragma('synchronous = OFF');
-        } catch { /* keep WAL */ }
-      }
-      const deferWal = !fastInit && process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let fastInit = false;
+      let deferWal = false;
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
-      // Set when the fastInit+pool path below defers autocheckpointing, so the
-      // finally knows to restore the interval on that path too.
+      // The fast-init parse lane may also defer auto-checkpointing.
       let restoreAutocheckpoint = false;
-      if (deferWal) {
-        priorAutocheckpoint = this.db.getWalAutocheckpoint();
-        this.db.setWalAutocheckpoint(0);
-        walValve = new WalCheckpointValve(
-          this.db,
-          resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
-          undefined,
-          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
-        );
-        walValve.start();
-      }
       try {
-        const gitState = this.orchestrator.beginGitIndexState(true);
+        // Discovery must complete before even advisory metadata or journal/FTS
+        // changes. Reuse this observation throughout the extraction phase.
+        const preparedScan = await this.orchestrator.prepareScan(options.onProgress);
+        const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
+        fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
+        if (fastInit) {
+          try {
+            this.db.getDb().pragma('journal_mode = MEMORY');
+            this.db.getDb().pragma('synchronous = OFF');
+          } catch { /* keep WAL */ }
+        }
+        deferWal = !fastInit && process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+        if (deferWal) {
+          priorAutocheckpoint = this.db.getWalAutocheckpoint();
+          this.db.setWalAutocheckpoint(0);
+          walValve = new WalCheckpointValve(
+            this.db,
+            resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
+            undefined,
+            options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+          );
+          walValve.start();
+        }
+        const gitState = this.orchestrator.beginGitIndexState(true, preparedScan.gitState);
         const before = this.queries.getNodeAndEdgeCount();
         // Mark the index as in-flight BEFORE any writes: a run killed
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
@@ -599,7 +569,8 @@ export class CodeGraph {
             // Store-writer offload is fresh-DB-only: with any pre-existing
             // data the store path must read (existing-file checks, cross-file
             // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null,
+            preparedScan
           );
         } finally {
           if (freshDb) {
@@ -746,7 +717,7 @@ export class CodeGraph {
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) {
           this.stampPythonRootFingerprint();
-          this.stampCppIncludeSnapshot();
+          await this.stampCppIncludeSnapshot();
         }
 
         if (result.success && result.filesIndexed > 0) {
@@ -862,15 +833,17 @@ export class CodeGraph {
 
   getCppIncludeEnvironmentStatus(): ReturnType<typeof checkCppIncludeSnapshot> {
     if (!this.hasCppIncludeFiles()) {
-      return { observed: true, complete: true, changed: false, affectedFiles: [] };
+      return { observed: true, complete: true, inputsVerified: true, changed: false, affectedFiles: [] };
     }
     return checkCppIncludeSnapshot(this.projectRoot, this.queries.getMetadata(CPP_INCLUDE_SNAPSHOT_KEY));
   }
 
-  private stampCppIncludeSnapshot(): void {
+  private async stampCppIncludeSnapshot(): Promise<void> {
+    if (this.queries.getAllFilePaths().some(file => /\.Build\.cs$/i.test(file))) await ensureUeModuleGrammar();
     const snapshot = this.resolver.getCppIncludeSnapshot(this.queries.getMetadata(CPP_INCLUDE_SNAPSHOT_KEY));
     this.queries.setMetadata(CPP_INCLUDE_SNAPSHOT_KEY, JSON.stringify(snapshot));
     this.queries.setMetadata('ue_module_metadata_observed', snapshot.ueModules ? '1' : '0');
+    this.queries.setMetadata('ue_module_metadata_version', '1');
   }
 
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
@@ -883,65 +856,91 @@ export class CodeGraph {
           `Sync could not acquire the file lock; retry when the index is available. ${err instanceof Error ? err.message : String(err)}`
         );
       }
-      // A full rebuild in another process (`codegraph index` → recreate)
-      // unlinks the database and creates a new file at the same path. A
-      // long-lived instance — the MCP daemon's watcher — would otherwise keep
-      // "syncing" into the dead inode, and nothing it wrote there is visible
-      // to anyone (#1902). Follow the path before writing (one stat), and
-      // widen a scoped sync to a full one: whatever the old handle absorbed
-      // since the rebuild is gone, so the new file has to be reconciled whole.
-      // If the reopen fails (the rebuild is mid-way), report lock contention
-      // so the watcher keeps its pending files and retries.
-      try {
-        this.reopenReplacedDatabase();
-      } catch (err) {
-        this.fileLock.release();
-        throw new LockUnavailableError(
-          `Sync could not open the rebuilt index yet; retry when the rebuild finishes. ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-      if (this.pendingFullReconcile) {
-        // `codegraph index` recreates the file, THEN takes the write lock in
-        // indexAll. A sync landing in that gap would otherwise run a full
-        // reconcile of the empty file and hold the lock the rebuild is about
-        // to ask for. A fresh file with no index_state yet is that rebuild:
-        // step aside (lock contention, the watcher retries) and reconcile in
-        // full once it is done. Bounded, so a rebuild that died before
-        // indexing does not park the watcher forever.
-        if (this.getIndexState() === null && this.isFreshlyRecreated()) {
-          this.fileLock.release();
-          throw new LockUnavailableError('A rebuild of this index is in progress; retry when it finishes.');
-        }
-        // Cleared only once this run completes (below): a sync that throws
-        // must leave the full catch-up for the next one.
-        options = { ...options, paths: undefined };
-      }
-      // Defer WAL auto-checkpointing for the whole incremental run, exactly
-      // as indexAll does for the bulk path (#1231): sync's store loop and its
-      // resolution passes churn the same FTS + secondary-index hot pages, and
-      // at the default 1000-page cadence the inline checkpoints re-write them
-      // over and over — on HDD-class storage a 7-file sync took 2 minutes at
-      // 0-2% CPU (#1248). The cost scales with the EXISTING database size,
-      // not the change size, so small syncs on big indexes hurt most. The
-      // valve bounds WAL growth off-thread; runMaintenance at the end does
-      // the final fold-up before the interval is restored in the finally.
-      // Same kill switch as indexAll: CODEGRAPH_NO_WAL_DEFER=1. Idle valve
-      // cost is one timer, so watcher-frequency syncs stay cheap.
-      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let deferWal = false;
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
-      if (deferWal) {
-        priorAutocheckpoint = this.db.getWalAutocheckpoint();
-        this.db.setWalAutocheckpoint(0);
-        walValve = new WalCheckpointValve(
-          this.db,
-          resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
-          undefined,
-          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
-        );
-        walValve.start();
-      }
       try {
+        let preparedBeforeReopen: PreparedFileScan | undefined;
+        if (this.db.isReplacedOnDisk()) {
+          // Opening writable would migrate/repair the replacement before an
+          // incomplete scan can be rejected. Observe its own tracked paths
+          // read-only first, then reuse the successful full scan after reopening.
+          options = { ...options, paths: undefined };
+          let probe: DatabaseConnection;
+          try {
+            probe = DatabaseConnection.open(this.db.getPath(), { readOnly: true });
+          } catch (err) {
+            throw new LockUnavailableError(`Sync could not inspect the replaced index yet; retry when replacement finishes. ${err instanceof Error ? err.message : String(err)}`);
+          }
+          try {
+            const observer = new ExtractionOrchestrator(this.projectRoot, new QueryBuilder(probe.getDb()));
+            preparedBeforeReopen = await observer.prepareScan(options.onProgress);
+            if (probe.isReplacedOnDisk()) throw new LockUnavailableError('The index changed during source discovery; retry when replacement finishes.');
+          } finally {
+            probe.close();
+          }
+        }
+        // A full rebuild in another process (`codegraph index` → recreate)
+        // unlinks the database and creates a new file at the same path. A
+        // long-lived instance — the MCP daemon's watcher — would otherwise keep
+        // "syncing" into the dead inode, and nothing it wrote there is visible
+        // to anyone (#1902). Follow the path before writing (one stat), and
+        // widen a scoped sync to a full one: whatever the old handle absorbed
+        // since the rebuild is gone, so the new file has to be reconciled whole.
+        // If the reopen fails (the rebuild is mid-way), report lock contention
+        // so the watcher keeps its pending files and retries.
+        try {
+          this.reopenReplacedDatabase();
+        } catch (err) {
+          throw new LockUnavailableError(
+            `Sync could not open the rebuilt index yet; retry when the rebuild finishes. ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        if (this.pendingFullReconcile) {
+          // `codegraph index` recreates the file, THEN takes the write lock in
+          // indexAll. A sync landing in that gap would otherwise run a full
+          // reconcile of the empty file and hold the lock the rebuild is about
+          // to ask for. A fresh file with no index_state yet is that rebuild:
+          // step aside (lock contention, the watcher retries) and reconcile in
+          // full once it is done. Bounded, so a rebuild that died before
+          // indexing does not park the watcher forever.
+          if (this.getIndexState() === null && this.isFreshlyRecreated()) {
+            throw new LockUnavailableError('A rebuild of this index is in progress; retry when it finishes.');
+          }
+          // Cleared only once this run completes (below): a sync that throws
+          // must leave the full catch-up for the next one.
+          options = { ...options, paths: undefined };
+        }
+        // Resolve every scope expansion before preparing the single observation
+        // used for reconciliation. No freshness/journal writes precede it.
+        const cppEnvironmentBefore = this.getCppIncludeEnvironmentStatus();
+        const forceCppContentCheck = cppEnvironmentBefore.physicalRootsChanged ? new Set(cppEnvironmentBefore.affectedFiles) : undefined;
+        if (forceCppContentCheck && options.paths) options = { ...options, paths: [...new Set([...options.paths, ...forceCppContentCheck])] };
+        const fullReconcile = !options.paths || options.paths.length === 0;
+        const preparedScan = preparedBeforeReopen ?? await this.orchestrator.prepareScan(options.onProgress, options.paths);
+        // Defer WAL auto-checkpointing for the whole incremental run, exactly
+        // as indexAll does for the bulk path (#1231): sync's store loop and its
+        // resolution passes churn the same FTS + secondary-index hot pages, and
+        // at the default 1000-page cadence the inline checkpoints re-write them
+        // over and over — on HDD-class storage a 7-file sync took 2 minutes at
+        // 0-2% CPU (#1248). The cost scales with the EXISTING database size,
+        // not the change size, so small syncs on big indexes hurt most. The
+        // valve bounds WAL growth off-thread; runMaintenance at the end does
+        // the final fold-up before the interval is restored in the finally.
+        // Same kill switch as indexAll: CODEGRAPH_NO_WAL_DEFER=1. Idle valve
+        // cost is one timer, so watcher-frequency syncs stay cheap.
+        deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+        if (deferWal) {
+          priorAutocheckpoint = this.db.getWalAutocheckpoint();
+          this.db.setWalAutocheckpoint(0);
+          walValve = new WalCheckpointValve(
+            this.db,
+            resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
+            undefined,
+            options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+          );
+          walValve.start();
+        }
         // Captured BEFORE the sync runs: the sync's own incremental writes
         // populate vocab rows for the files it touches, so an end-of-sync
         // emptiness check would see "non-empty" and skip the backfill forever,
@@ -956,16 +955,12 @@ export class CodeGraph {
         // timer-driven PASSIVE checkpoints ran, and a query-pool reader could
         // pin frames while the WAL grew without a bound.
         const backpressure = walValve ? () => walValve!.backpressure() : undefined;
-        const fullReconcile = !options.paths || options.paths.length === 0;
-        const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
+        const gitState = this.orchestrator.beginGitIndexState(fullReconcile, preparedScan.gitState);
 
         if (this.hasCppIncludeFiles() && this.queries.getAllFilePaths().some(f => /\.Build\.cs$/i.test(f))) {
           await initGrammars();
           await loadGrammarsForLanguages(['csharp']);
         }
-        const cppEnvironmentBefore = this.getCppIncludeEnvironmentStatus();
-        const forceCppContentCheck = cppEnvironmentBefore.physicalRootsChanged ? new Set(cppEnvironmentBefore.affectedFiles) : undefined;
-        if (forceCppContentCheck && options.paths) options = { ...options, paths: [...new Set([...options.paths, ...forceCppContentCheck])] };
         const pythonFilesBefore = this.pythonFilePaths();
         // An interrupted index may have absorbed its changed files before
         // resolution/synthesis. Detect those orphans BEFORE this sync adds refs.
@@ -987,7 +982,7 @@ export class CodeGraph {
               refreshSynthesis = true;
               this.queries.setMetadata('synthesis_pending', '1');
             }
-          }, forceCppContentCheck);
+          }, forceCppContentCheck, preparedScan);
 
         // A component a tag in an unchanged file may render: `<Team />` links
         // to the `Team` this sync adds. The gate above reads each changed file
@@ -1315,8 +1310,20 @@ export class CodeGraph {
           }
           }
 
+        const moduleMetadataUnobserved = this.queries.getMetadata('ue_module_metadata_version') !== '1' &&
+          this.queries.getAllFilePaths().some(file => /\.Build\.cs$/i.test(file));
+        let legacyUeModules = false;
+        if (moduleMetadataUnobserved) {
+          this.resolver.clearCaches();
+          await ensureUeModuleGrammar();
+          legacyUeModules = this.resolver.getResolutionContext().getUeModuleRules?.().some(observation => observation.rules.isModuleRules) ?? false;
+        }
+        // A missing legacy snapshot has no identity drift to replay. Repair
+        // its imports below; an observed metadata change keeps the normal
+        // invalidation path, including synthesis when its inputs moved.
+        const legacyIncludeInitialization = legacyUeModules && !cppEnvironmentBefore.observed && !filesChanged && result.filesRemoved === 0;
         // Compiler metadata and excluded shadow headers can move answers without a source edit.
-        if (cppEnvironmentBefore.changed) {
+        if (cppEnvironmentBefore.changed && !legacyIncludeInitialization) {
           this.resolver.clearCaches();
           const cppFiles = new Set(this.queries.getFileLanguages().filter(f => f.language === 'c' || f.language === 'cpp').map(f => f.path));
           const files = cppEnvironmentBefore.observed ? this.resolver.getCppIncludeAffectedFiles(cppEnvironmentBefore.affectedFiles) :
@@ -1330,10 +1337,11 @@ export class CodeGraph {
         }
         const moduleMetadataChanged = cppEnvironmentBefore.changed && (cppEnvironmentBefore.affectedFiles.some(f => /\.Build\.cs$/i.test(f)) ||
           cppEnvironmentBefore.affectedFiles.length === 0 && this.queries.getMetadata('ue_module_metadata_observed') === '1');
-        if (moduleMetadataChanged || [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])].some(f => /\.Build\.cs$/i.test(f))) {
+        if (moduleMetadataUnobserved || moduleMetadataChanged || [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])].some(f => /\.Build\.cs$/i.test(f))) {
           this.resolver.clearCaches();
           await initGrammars(); await loadGrammarsForLanguages(['csharp']);
           await this.resolver.refreshUeModuleGraph();
+          if (legacyUeModules) await this.resolver.repairLegacyUeIncludeImports();
         }
 
         // Python module answers this sync may have moved in files it never
@@ -1504,7 +1512,7 @@ export class CodeGraph {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
 
-        this.stampCppIncludeSnapshot();
+        await this.stampCppIncludeSnapshot();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;

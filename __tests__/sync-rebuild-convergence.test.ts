@@ -41,6 +41,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { createDatabase } from '../src/db/sqlite-adapter';
+import { getDatabasePath, removeDatabaseFiles } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
 import { ToolHandler } from '../src/mcp/tools';
 
@@ -107,10 +108,9 @@ describe('Incremental sync converges to a full rebuild (CG-33)', INDEXING_TIMEOU
 
   /**
    * Rebuild the index from scratch over the CURRENT tree and return its edge
-   * set — the ground truth a user gets from `codegraph index`.
+   * set — the ground truth from a fresh independent database.
    *
-   * It must go through `CodeGraph.recreate`, which is what the CLI's `index`
-   * command does: it DELETES the database file and builds an empty one. Calling
+   * Explicit fixture cleanup deletes this test's database and creates an empty one. Calling
    * `indexAll` on the live handle instead is not a rebuild at all — every file
    * hashes identical, so the store writes nothing (`nodesCreated: 0`), no
    * reference is re-created, and every existing edge survives untouched. The
@@ -118,10 +118,11 @@ describe('Incremental sync converges to a full rebuild (CG-33)', INDEXING_TIMEOU
    * which is exactly how this suite passed with `CODEGRAPH_NO_REBIND=1` (CG-35).
    */
   const rebuildEdgeSet = async (): Promise<Set<string>> => {
-    // Close the live handle first: `recreate` unlinks the database file, and a
+    // Close the live handle first: fixture cleanup unlinks the database file, and a
     // held handle makes that EBUSY on Windows.
     cg.destroy();
-    cg = await CodeGraph.recreate(testDir);
+    removeDatabaseFiles(getDatabasePath(testDir));
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     return edgeSet();
   };
@@ -556,7 +557,8 @@ export function onPing(): void {}
   const converges = async () => {
     const synced = readEdges();
     cg.close();
-    cg = await CodeGraph.recreate(dir, { silent: true });
+    removeDatabaseFiles(getDatabasePath(dir));
+    cg = CodeGraph.initSync(dir);
     await cg.indexAll();
     expect(synced).toEqual(readEdges());
   };

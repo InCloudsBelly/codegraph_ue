@@ -101,9 +101,10 @@ describe('exclude behavior — scanDirectory drops excluded paths (#999)', () =>
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-exclude-scan-'));
     clearProjectConfigCache();
   });
-  afterEach(() => {
+  afterEach(async () => {
     clearProjectConfigCache();
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Let Windows release handles from Git children before retrying removal.
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
 
   const gitInit = () => {

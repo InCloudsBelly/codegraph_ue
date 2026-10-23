@@ -53,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, assertNoExistingIndexArtifacts, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { getIndexingConfigStatus } from '../indexing-config';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
@@ -702,7 +702,7 @@ async function runInit(
 
     if (isInitialized(projectPath)) {
       clack.log.warn(`Already initialized in ${projectPath}`);
-      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      clack.log.info('Use "codegraph sync" to update, or build and validate an independent CODEGRAPH_DIR candidate with "codegraph init" for a fresh index');
       try {
         const { offerWatchFallback } = await import('../installer');
         await offerWatchFallback(clack, projectPath, { yes: options.yes });
@@ -865,7 +865,7 @@ program
  */
 program
   .command('index [path]')
-  .description('Rebuild the full index from scratch (same result as a fresh init)')
+  .description('Preserve existing indexes; rebuild using an independent CODEGRAPH_DIR candidate and init')
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
@@ -876,7 +876,7 @@ program
     // but for a full re-index it silently rebuilt the parent's graph under a
     // normal "Done" when <path> had no index of its own (#1524). Only a bare
     // `codegraph index` (cwd) may resolve upward.
-    const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
+    const projectPath = path.resolve(pathArg ?? process.cwd());
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -887,11 +887,21 @@ program
         process.exit(1);
       }
 
+      // Refuse before schema probes, daemon shutdown, or opening/migrating the
+      // graph. A failed rebuild must leave the last-good database available.
+      // A bare invocation used to resolve upward through SQLite schema probes.
+      // Refuse any ancestor artifact using only filesystem probes instead.
+      for (let probe = projectPath; ; ) {
+        assertNoExistingIndexArtifacts(probe);
+        const parent = path.dirname(probe);
+        if (pathArg || parent === probe) break;
+        probe = parent;
+      }
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         const ancestor = pathArg ? resolveProjectPath(pathArg) : projectPath;
         if (ancestor !== projectPath) {
-          info(`The nearest initialized project is ${ancestor} — pass that path to rebuild it, or run "codegraph init" in ${projectPath} to index it on its own.`);
+          info(`The nearest initialized project is ${ancestor} — use "codegraph sync" to update it, or run "codegraph init" in ${projectPath} to index this path on its own.`);
         } else {
           info('Run "codegraph init" first');
         }
@@ -1144,6 +1154,7 @@ program
       const cppIncludeEnvironment = cppEnvironmentStatus ? {
         observed: cppEnvironmentStatus.observed,
         complete: cppEnvironmentStatus.complete,
+        inputsVerified: cppEnvironmentStatus.inputsVerified,
         changed: cppEnvironmentStatus.changed,
         affectedFileCount: cppEnvironmentStatus.affectedFiles.length,
         ...(cppEnvironmentStatus.reason ? { reason: cppEnvironmentStatus.reason } : {}),
@@ -1294,8 +1305,13 @@ program
       }
       const missingSymbols = health ? describeFilesMissingSymbols(health) : [];
       for (const line of missingSymbols) warn(line);
-      const cppEnvironmentVerified = cppIncludeEnvironment?.observed && cppIncludeEnvironment.complete && !cppIncludeEnvironment.changed;
-      if (cppIncludeEnvironment && !cppEnvironmentVerified) warn('C/C++ include dependencies are not fully verified; the index cannot be reported up to date.');
+      const cppInputsVerified = cppIncludeEnvironment?.observed && cppIncludeEnvironment.inputsVerified === true && !cppIncludeEnvironment.changed;
+      const cppEnvironmentVerified = cppInputsVerified && cppIncludeEnvironment.complete;
+      if (cppInputsVerified && !cppIncludeEnvironment.complete) {
+        warn('C/C++ tracked inputs verified; include coverage incomplete. Relationships may be missing or incorrectly resolved.');
+      } else if (cppIncludeEnvironment && !cppEnvironmentVerified) {
+        warn('C/C++ include dependencies are not fully verified; the index cannot be reported up to date.');
+      }
       if (totalChanges === 0 && missingSymbols.length === 0 && cppEnvironmentVerified) {
         success('Index is up to date');
       }

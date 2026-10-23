@@ -1,6 +1,12 @@
 import * as path from 'path';
 import type { Node as SyntaxNode, Tree } from 'web-tree-sitter';
-import { getParser } from '../extraction/grammars';
+import { getParser, loadGrammarsForLanguages } from '../extraction/grammars';
+
+/** Module metadata readers use the C# AST even when extraction ran in workers. */
+export async function ensureUeModuleGrammar(): Promise<void> {
+  await loadGrammarsForLanguages(['csharp']);
+  if (!getParser('csharp')) throw new Error('UE module metadata requires the C# grammar');
+}
 
 export type UeDependencyKind = 'public' | 'private' | 'public-include' | 'private-include' | 'dynamic';
 export interface UeModuleRules {

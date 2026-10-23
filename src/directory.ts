@@ -122,6 +122,31 @@ export function getCodeGraphDir(projectRoot: string): string {
 }
 
 /**
+ * Raw rebuilds may not replace a last-good graph with an empty database.
+ * Probe artifacts without opening/migrating SQLite or trusting existsSync,
+ * which cannot distinguish missing paths from inaccessible ones.
+ */
+export function assertNoExistingIndexArtifacts(projectRoot: string): void {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    const artifact = dbPath + suffix;
+    let reason = 'an existing index artifact';
+    try {
+      fs.lstatSync(artifact);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+      reason = `an index artifact whose state cannot be confirmed (${error instanceof Error ? error.message : String(error)})`;
+    }
+    throw new Error(
+      `Refusing destructive rebuild: preserving existing index at ${artifact} — ${reason}. ` +
+      'Use "codegraph sync" for updates, or set CODEGRAPH_DIR to an independent empty candidate directory name ' +
+      '(for example .codegraph-candidate) and run "codegraph init". Validate that candidate before switching, and retain the original as a backup.'
+    );
+  }
+}
+
+/**
  * Check if a project has been initialized with CodeGraph.
  *
  * Requires `.codegraph/codegraph.db` to exist AND to carry the codegraph

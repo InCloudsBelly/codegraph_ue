@@ -512,4 +512,28 @@ describe('C++ overloads chosen by argument types', () => {
       cg.close();
     }
   });
+
+  it('bounds recursive type inference for nested overloaded calls', async () => {
+    const cg = await indexed({
+      'material/recursive-overloads.cpp': lines(
+        'struct Expr {};',
+        'class Arithmetic {',
+        ' public:',
+        '  Expr Sub(float, Expr) { return {}; }',
+        '  Expr Sub(Expr, Expr) { return {}; }',
+        '  Expr Mul(float, Expr) { return {}; }',
+        '  Expr Mul(Expr, Expr) { return {}; }',
+        '  void Build(float eta, Expr x) {',
+        '    auto value = Sub(1.0f, Mul(eta * eta, Sub(1.0f, Mul(x, x))));',
+        '  }',
+        '};',
+      ),
+    });
+    try {
+      expect(callsAt(cg, method(cg, 'Arithmetic::Build')).filter((call) => call.includes('Sub:'))).not.toHaveLength(0);
+      expect(cg.getPendingReferenceCount()).toBe(0);
+    } finally {
+      cg.close();
+    }
+  });
 });
