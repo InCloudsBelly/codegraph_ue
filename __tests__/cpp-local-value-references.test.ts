@@ -127,4 +127,153 @@ describe('C++ value references bound in the calling function', () => {
       cg.close();
     }
   });
+
+  it('keeps multiline control initializers local through their headers and bodies only', async () => {
+    const source = lines(
+      'struct Payload { int Value; };',
+      'Payload Product;',
+      'int Multiline(bool Take, Payload Arg) {',
+      '  int Sum = Product.Value; // before controls',
+      '  if (',
+      '    Payload Product = Arg;',
+      '    Take && Product.Value > 0',
+      '  ) { Sum += Product.Value; } else { Sum -= Product.Value; }',
+      '  Sum += Product.Value; // after multiline if',
+      '  for (',
+      '    Payload Product = Arg;',
+      '    Product.Value < 1;',
+      '    ++Product.Value',
+      '  ) Sum += Product.Value;',
+      '  Sum += Product.Value; // after multiline for',
+      '  switch (',
+      '    Payload Product = Arg;',
+      '    Product.Value',
+      '  ) { case 0: Sum += Product.Value; break; }',
+      '  Sum += Product.Value; // after multiline switch',
+      '  if constexpr (Payload Product = Arg; true) { Sum += Product.Value; }',
+      '  if (Payload* Product = &Arg; Take) { Sum += Product->Value; }',
+      '  if (Payload& Product = Arg; Take) { Sum += Product.Value; }',
+      '  return Sum + Product.Value; // after constexpr if',
+      '}',
+    );
+    const cg = await indexed({ 'multiline-controls.cpp': source });
+    try {
+      expect(targets(cg, 'Multiline', 'references')).toEqual([
+        'int Sum = Product.Value;',
+        'Sum += Product.Value; // after multiline if',
+        'Sum += Product.Value; // after multiline for',
+        'Sum += Product.Value; // after multiline switch',
+        'return Sum + Product.Value;',
+      ].map((text) => `${lineOf(source, text)} -> Product`).sort());
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('binds each else to its own unbraced if before ending the enclosing control scope', async () => {
+    const source = lines(
+      'struct Payload { int Value; };',
+      'Payload Product;',
+      'int Nested(bool Take, bool Inner, Payload Arg) {',
+      '  int Sum = 0;',
+      '  if (Payload Product = Arg; Take)',
+      '    if (Inner) { Sum += Product.Value; }',
+      '    else { Sum -= Product.Value; }',
+      '  else if (Inner) Sum += Product.Value;',
+      '  else',
+      '    for (int Index = 0; Index < 1; ++Index)',
+      '      if (Take) Sum += Product.Value;',
+      '      else Sum -= Product.Value;',
+      '  Sum += Product.Value; // after nested if',
+      '  for (Payload Product = Arg; Product.Value < 1; ++Product.Value)',
+      '    if (Take) Sum += Product.Value;',
+      '    else Sum -= Product.Value;',
+      '  Sum += Product.Value; // after unbraced for',
+      '  if (Payload Product = Arg; Take)',
+      '    do { Sum += Product.Value; } while (Product.Value > 0);',
+      '  else Sum -= Product.Value;',
+      '  return Sum + Product.Value; // after do while',
+      '}',
+    );
+    const cg = await indexed({ 'nested-controls.cpp': source });
+    try {
+      expect(targets(cg, 'Nested', 'references')).toEqual([
+        'Sum += Product.Value; // after nested if',
+        'Sum += Product.Value; // after unbraced for',
+        'return Sum + Product.Value;',
+      ].map((text) => `${lineOf(source, text)} -> Product`).sort());
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('keeps qualified calls and conditional expressions inside an attributed single-statement body', async () => {
+    const source = lines(
+      'struct Payload { int Value; };',
+      'Payload Product;',
+      'namespace Values { int constructor(int Value) { return Value; } }',
+      'int Expressions(bool Take, Payload Arg) {',
+      '  int Sum = 0;',
+      '  for (Payload Product = Arg; Product.Value < 1; ++Product.Value)',
+      '    Sum += Values::constructor(Product.Value) ? Product.Value : Product.Value;',
+      '  Sum += Product.Value; // after conditional expression',
+      '  if (Payload Product = Arg; Take)',
+      '    [[likely]] while (Take) Sum += Values::constructor(Product.Value);',
+      '  else { /* else ; } */ const char* Text = "; } else"; Sum += Product.Value; }',
+      '  return Sum + Product.Value; // after attributed while',
+      '}',
+    );
+    const cg = await indexed({ 'control-expressions.cpp': source });
+    try {
+      expect(targets(cg, 'Expressions', 'references')).toEqual([
+        'Sum += Product.Value; // after conditional expression',
+        'return Sum + Product.Value;',
+      ].map((text) => `${lineOf(source, text)} -> Product`).sort());
+    } finally {
+      cg.close();
+    }
+  });
+
+  it.each([['*', ','], ['*', ';'], ['&', ','], ['&', ';']])('keeps global body reads when a control header uses %s before %s', async (operator, separator) => {
+    const source = lines(
+      'struct Payload { int Value; Payload operator[](int Index) const { return *this; } };',
+      'Payload Product;',
+      `int operator${operator}(int Factor, Payload Value) { return Factor; }`,
+      'int CommaExpressions(int A) {',
+      '  int Sum = 0;',
+      '  int Factor = A;',
+      '  if (',
+      `    A ${operator} Product${separator}`,
+      '    true',
+      '  ) { Sum += Product.Value; } // parameter multiplication',
+      '  if (',
+      `    Factor ${operator} Product${separator}`,
+      '    true',
+      '  ) { Sum += Product.Value; } // local multiplication',
+      '  if (',
+      `    A ${operator} Factor, Product${separator}`,
+      '    true',
+      '  ) { Sum += Product.Value; } // comma sequence',
+      '  if (',
+      `    A ${operator} Product[0]${separator}`,
+      '    true',
+      '  ) { Sum += Product.Value; } // indexed expression',
+      '  return Sum + Product.Value; // after comma conditions',
+      '}',
+    );
+    const cg = await indexed({ 'comma-conditions.cpp': source });
+    try {
+      // The parser can classify the ambiguous header as a declarator; this
+      // guard must still preserve the ordinary global reads in its body.
+      expect(targets(cg, 'CommaExpressions', 'references')).toEqual(expect.arrayContaining([
+        ') { Sum += Product.Value; } // parameter multiplication',
+        ') { Sum += Product.Value; } // local multiplication',
+        ') { Sum += Product.Value; } // comma sequence',
+        ') { Sum += Product.Value; } // indexed expression',
+        'return Sum + Product.Value;',
+      ].map((text) => `${lineOf(source, text)} -> Product`)));
+    } finally {
+      cg.close();
+    }
+  });
 });

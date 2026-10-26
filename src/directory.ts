@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { isWslWindowsDrive } from './sync/watch-policy';
 
 /** The default per-project data directory name. */
@@ -83,6 +84,8 @@ export function isCodeGraphDataDir(name: string): boolean {
   return (
     name === DEFAULT_CODEGRAPH_DIR ||
     name === codeGraphDirName() ||
+    name.startsWith(DEFAULT_CODEGRAPH_DIR + '.publication.') ||
+    name.startsWith(codeGraphDirName() + '.publication.') ||
     name.startsWith(DEFAULT_CODEGRAPH_DIR + '-')
   );
 }
@@ -105,11 +108,21 @@ export function isCodeGraphDataDir(name: string): boolean {
  */
 export function codeGraphDirNameFor(projectRoot: string): string {
   if (process.env.CODEGRAPH_DIR?.trim() || !isWslWindowsDrive(projectRoot)) return codeGraphDirName();
+  const publicationMayExist = (name: string): boolean => {
+    for (const suffix of ['.publication.json', '.publication.lock']) {
+      try { fs.lstatSync(path.join(projectRoot, name + suffix)); return true; } catch (error) {
+        if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') return true;
+      }
+    }
+    return false;
+  };
+  if (publicationMayExist(WSL_CODEGRAPH_DIR)) return WSL_CODEGRAPH_DIR;
   try {
     if (fs.statSync(path.join(projectRoot, WSL_CODEGRAPH_DIR)).isDirectory()) return WSL_CODEGRAPH_DIR;
   } catch {
     // absent — fall through
   }
+  if (publicationMayExist(DEFAULT_CODEGRAPH_DIR)) return DEFAULT_CODEGRAPH_DIR;
   if (fs.existsSync(path.join(projectRoot, DEFAULT_CODEGRAPH_DIR, 'codegraph.db'))) return DEFAULT_CODEGRAPH_DIR;
   return WSL_CODEGRAPH_DIR;
 }
@@ -121,13 +134,117 @@ export function getCodeGraphDir(projectRoot: string): string {
   return path.join(projectRoot, codeGraphDirNameFor(projectRoot));
 }
 
+/** Publication state lives outside the index so a directory move cannot hide it. */
+export function getIndexPublicationPaths(projectRoot: string): {
+  indexDirectory: string; markerPath: string; lockPath: string;
+} {
+  const indexDirectory = codeGraphDirNameFor(projectRoot);
+  return {
+    indexDirectory,
+    markerPath: path.join(projectRoot, `${indexDirectory}.publication.json`),
+    lockPath: path.join(projectRoot, `${indexDirectory}.publication.lock`),
+  };
+}
+
+const initializationLeases = new Map<string, { fd: number; content: string }>();
+
+/** Only proven-absent publication state permits ordinary access. */
+export function assertNoPendingIndexPublication(projectRoot: string): void {
+  const { markerPath, lockPath } = getIndexPublicationPaths(projectRoot);
+  let markerAbsent = false;
+  try {
+    fs.lstatSync(markerPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
+      throw new Error(`CodeGraph index publication state cannot be confirmed at ${markerPath}; recover the publication before accessing this index.`);
+    }
+    markerAbsent = true;
+  }
+  if (!markerAbsent) {
+    throw new Error(`CodeGraph index publication is pending at ${markerPath}; recover the publication before accessing this index.`);
+  }
+  const own = initializationLeases.get(path.resolve(lockPath));
+  let current: fs.Stats;
+  try {
+    current = fs.lstatSync(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT' && !own) return;
+    throw new Error(`CodeGraph index publication lease state cannot be confirmed at ${lockPath}; recover the publication before accessing this index.`);
+  }
+  if (own && !current.isSymbolicLink()) {
+    try {
+      const held = fs.fstatSync(own.fd);
+      if (current.dev === held.dev && current.ino === held.ino &&
+          fs.readFileSync(lockPath, 'utf8') === own.content) return;
+    } catch {
+      throw new Error(`CodeGraph index publication lease state cannot be confirmed at ${lockPath}; recover the publication before accessing this index.`);
+    }
+  }
+  throw new Error(`CodeGraph index publication lease is pending at ${lockPath}; recover the publication before accessing this index.`);
+}
+
+/** A shared exclusive lease serializes initialization with candidate publication. */
+export function acquireIndexPublicationLease(
+  projectRoot: string,
+  purpose: 'initialize' | 'publication',
+  transactionId: string = randomUUID(),
+): () => void {
+  const { indexDirectory, lockPath } = getIndexPublicationPaths(projectRoot);
+  const content = JSON.stringify({ schemaVersion: 1, indexDirectory, purpose, transactionId, pid: process.pid });
+  let fd: number;
+  try {
+    fd = fs.openSync(lockPath, 'wx');
+  } catch {
+    throw new Error(`CodeGraph index publication lease is busy or inaccessible at ${lockPath}; recover any interrupted publication before retrying.`);
+  }
+  try {
+    fs.writeFileSync(fd, content);
+    fs.fsyncSync(fd);
+  } catch (error) {
+    fs.closeSync(fd);
+    // An incomplete ownership record is deliberately retained for recovery.
+    throw error;
+  }
+  const owned = fs.fstatSync(fd);
+  const leaseKey = path.resolve(lockPath);
+  if (purpose === 'initialize') initializationLeases.set(leaseKey, { fd, content });
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (initializationLeases.get(leaseKey)?.fd === fd) initializationLeases.delete(leaseKey);
+    try {
+      const current = fs.lstatSync(lockPath);
+      if (current.isSymbolicLink() || current.dev !== owned.dev || current.ino !== owned.ino ||
+          fs.readFileSync(lockPath, 'utf8') !== content) {
+        throw new Error('CodeGraph index publication lease ownership changed; preserving the current lease.');
+      }
+      fs.unlinkSync(lockPath);
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+}
+
 /**
  * Raw rebuilds may not replace a last-good graph with an empty database.
  * Probe artifacts without opening/migrating SQLite or trusting existsSync,
  * which cannot distinguish missing paths from inaccessible ones.
  */
 export function assertNoExistingIndexArtifacts(projectRoot: string): void {
-  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  assertNoPendingIndexPublication(projectRoot);
+  const directory = getCodeGraphDir(projectRoot);
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error('The index directory is not an ordinary directory.');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
+      throw new Error(`Refusing destructive rebuild: preserving existing index at ${directory} — index directory state cannot be confirmed.`);
+    }
+  }
+  const dbPath = path.join(directory, 'codegraph.db');
   for (const suffix of ['', '-wal', '-shm', '-journal']) {
     const artifact = dbPath + suffix;
     let reason = 'an existing index artifact';
@@ -135,7 +252,7 @@ export function assertNoExistingIndexArtifacts(projectRoot: string): void {
       fs.lstatSync(artifact);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | null)?.code;
-      if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+      if (code === 'ENOENT') continue;
       reason = `an index artifact whose state cannot be confirmed (${error instanceof Error ? error.message : String(error)})`;
     }
     throw new Error(
@@ -164,6 +281,7 @@ export function assertNoExistingIndexArtifacts(projectRoot: string): void {
  * schema, or a file SQLite refuses as not a database, says no.
  */
 export function isInitialized(projectRoot: string): boolean {
+  assertNoPendingIndexPublication(projectRoot);
   const codegraphDir = getCodeGraphDir(projectRoot);
   if (!fs.existsSync(codegraphDir) || !fs.statSync(codegraphDir).isDirectory()) {
     return false;
@@ -176,13 +294,15 @@ export function isInitialized(projectRoot: string): boolean {
   } catch {
     return false;
   }
-  return hasCodeGraphSchema(dbPath, st);
+  const initialized = hasCodeGraphSchema(dbPath, st);
+  assertNoPendingIndexPublication(projectRoot);
+  return initialized;
 }
 
 /**
- * `codegraph.db` exists at `projectRoot` but does not carry the schema, and
- * `init` can add it in place: an empty file, or a SQLite database without the
- * codegraph tables (#1895). A file that is not SQLite at all is NOT this case —
+ * `codegraph.db` exists at `projectRoot` but does not carry the schema:
+ * an empty file, or a SQLite database without the codegraph tables (#1895).
+ * Initialization preserves these files and requires explicit recovery. A file that is not SQLite at all is NOT this case —
  * see {@link hasForeignDbFile}.
  */
 export function hasSchemalessDb(projectRoot: string): boolean {
@@ -955,17 +1075,11 @@ function ensureGitignore(gitignorePath: string): boolean {
 
 /**
  * Create the .codegraph directory structure
- * Note: Only throws if codegraph.db already exists, not just if .codegraph/ exists.
+ * Existing database or recovery artifacts are preserved, even without a recognized schema.
  */
 export function createDirectory(projectRoot: string): void {
   const codegraphDir = getCodeGraphDir(projectRoot);
-
-  // Only throw if CodeGraph is actually initialized (db with a schema).
-  // .codegraph/ folder alone — or a schema-less codegraph.db left by an
-  // interrupted init (#1895) — is fine: initialize() adds the schema to it.
-  if (isInitialized(projectRoot)) {
-    throw new Error(`CodeGraph already initialized in ${projectRoot}`);
-  }
+  assertNoExistingIndexArtifacts(projectRoot);
 
   // Create main directory (if it doesn't exist)
   fs.mkdirSync(codegraphDir, { recursive: true });

@@ -38,6 +38,8 @@ import {
   removeDirectory,
   validateDirectory,
   assertNoExistingIndexArtifacts,
+  acquireIndexPublicationLease,
+  assertNoPendingIndexPublication,
 } from './directory';
 import {
   ExtractionOrchestrator,
@@ -63,6 +65,7 @@ import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
+
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
@@ -73,6 +76,14 @@ import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 import { CPP_INCLUDE_SNAPSHOT_KEY, checkCppIncludeSnapshot } from './resolution/cpp-include-environment';
 import { ensureUeModuleGrammar } from './resolution/ue-module-environment';
+
+/** Explicit init may create a new project directory, but uncertain I/O is never absence. */
+function ensureInitializationRoot(projectRoot: string): void {
+  try { fs.lstatSync(projectRoot); } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') throw error;
+    fs.mkdirSync(projectRoot, { recursive: true });
+  }
+}
 
 // Re-export types for consumers
 export * from './types';
@@ -256,18 +267,6 @@ export class CodeGraph {
    */
   private pendingFullReconcile = false;
 
-  /** How long a recreated, not-yet-indexed database is treated as a rebuild in progress. */
-  private static readonly RECREATE_GRACE_MS = 120_000;
-
-  /** The database file at the path was written within the recreate grace window. */
-  private isFreshlyRecreated(): boolean {
-    try {
-      return Date.now() - fs.statSync(getDatabasePath(this.projectRoot)).mtimeMs < CodeGraph.RECREATE_GRACE_MS;
-    } catch {
-      return false;
-    }
-  }
-
   /**
    * Heal a stale database handle in place. If `.codegraph/` was removed and
    * recreated at the SAME path while this instance held the DB open — a git
@@ -327,30 +326,32 @@ export class CodeGraph {
    * @returns A new CodeGraph instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
-    await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
-
-    // Check if already initialized
-    if (isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
+    ensureInitializationRoot(resolvedRoot);
+    const release = acquireIndexPublicationLease(resolvedRoot, 'initialize');
+    try {
+      assertNoPendingIndexPublication(resolvedRoot);
+      if (isInitialized(resolvedRoot)) {
+        throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
+      }
+      assertNoExistingIndexArtifacts(resolvedRoot);
+      await initGrammars();
+      createDirectory(resolvedRoot);
+      const db = DatabaseConnection.initialize(getDatabasePath(resolvedRoot));
+      const queries = new QueryBuilder(db.getDb());
+      const instance = new CodeGraph(db, queries, resolvedRoot);
+      if (options.index) {
+        try {
+          await instance.indexAll({ onProgress: options.onProgress });
+        } catch (error) {
+          instance.close();
+          throw error;
+        }
+      }
+      return instance;
+    } finally {
+      release();
     }
-
-    // Create directory structure
-    createDirectory(resolvedRoot);
-
-    // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.initialize(dbPath);
-    const queries = new QueryBuilder(db.getDb());
-
-    const instance = new CodeGraph(db, queries, resolvedRoot);
-
-    // Run initial indexing if requested
-    if (options.index) {
-      await instance.indexAll({ onProgress: options.onProgress });
-    }
-
-    return instance;
   }
 
   /**
@@ -358,21 +359,21 @@ export class CodeGraph {
    */
   static initSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
-
-    // Check if already initialized
-    if (isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
+    ensureInitializationRoot(resolvedRoot);
+    const release = acquireIndexPublicationLease(resolvedRoot, 'initialize');
+    try {
+      assertNoPendingIndexPublication(resolvedRoot);
+      if (isInitialized(resolvedRoot)) {
+        throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
+      }
+      assertNoExistingIndexArtifacts(resolvedRoot);
+      createDirectory(resolvedRoot);
+      const db = DatabaseConnection.initialize(getDatabasePath(resolvedRoot));
+      const queries = new QueryBuilder(db.getDb());
+      return new CodeGraph(db, queries, resolvedRoot);
+    } finally {
+      release();
     }
-
-    // Create directory structure
-    createDirectory(resolvedRoot);
-
-    // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.initialize(dbPath);
-    const queries = new QueryBuilder(db.getDb());
-
-    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -383,8 +384,9 @@ export class CodeGraph {
    * @returns A CodeGraph instance
    */
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
-    await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    assertNoPendingIndexPublication(resolvedRoot);
+    await initGrammars();
 
     // Check if initialized
     if (!isInitialized(resolvedRoot)) {
@@ -400,6 +402,7 @@ export class CodeGraph {
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    try { assertNoPendingIndexPublication(resolvedRoot); } catch (error) { db.close(); throw error; }
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -448,6 +451,7 @@ export class CodeGraph {
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    try { assertNoPendingIndexPublication(resolvedRoot); } catch (error) { db.close(); throw error; }
     const queries = new QueryBuilder(db.getDb());
 
     return new CodeGraph(db, queries, resolvedRoot);
@@ -847,7 +851,19 @@ export class CodeGraph {
   }
 
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
+    return this.syncWithPolicy(options, false);
+  }
+
+  /** @internal Automatic callers recheck data safety after acquiring the actual write gates. */
+  async syncAutomatically(options: IndexOptions = {}): Promise<SyncResult> {
+    return this.syncWithPolicy(options, true);
+  }
+
+  private async syncWithPolicy(options: IndexOptions, automatic: boolean): Promise<SyncResult> {
+    assertNoPendingIndexPublication(this.projectRoot);
     return this.indexMutex.withLock(async () => {
+      assertNoPendingIndexPublication(this.projectRoot);
+      if (automatic) this.assertAutomaticSyncAllowed();
       const startedAt = Date.now();
       try {
         this.fileLock.acquire();
@@ -860,6 +876,7 @@ export class CodeGraph {
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
       try {
+        if (automatic) this.assertAutomaticSyncAllowed();
         let preparedBeforeReopen: PreparedFileScan | undefined;
         if (this.db.isReplacedOnDisk()) {
           // Opening writable would migrate/repair the replacement before an
@@ -901,11 +918,12 @@ export class CodeGraph {
           // indexAll. A sync landing in that gap would otherwise run a full
           // reconcile of the empty file and hold the lock the rebuild is about
           // to ask for. A fresh file with no index_state yet is that rebuild:
-          // step aside (lock contention, the watcher retries) and reconcile in
-          // full once it is done. Bounded, so a rebuild that died before
-          // indexing does not park the watcher forever.
-          if (this.getIndexState() === null && this.isFreshlyRecreated()) {
-            throw new LockUnavailableError('A rebuild of this index is in progress; retry when it finishes.');
+          // step aside and reconcile only once it has completed. Elapsed time
+          // cannot turn an incomplete replacement into permission to reparse
+          // the whole repository automatically.
+          if (this.getIndexState() !== 'complete' || this.queries.getAllFilePaths().length === 0 ||
+              this.queries.getNodeAndEdgeCount().nodes === 0) {
+            throw new LockUnavailableError('The replacement index is incomplete or empty; explicitly recover it before retrying sync. Automatic full re-indexing is refused.');
           }
           // Cleared only once this run completes (below): a sync that throws
           // must leave the full catch-up for the next one.
@@ -1569,6 +1587,23 @@ export class CodeGraph {
     }
   }
 
+  /** @internal Automatic owners must never turn partial or empty graph data into a full bake. */
+  assertAutomaticSyncAllowed(): void {
+    assertNoPendingIndexPublication(this.projectRoot);
+    if (this.db.isReplacedOnDisk()) {
+      throw new Error('Automatic sync is refused after database replacement; explicitly verify or recover the active index.');
+    }
+    if (this.getIndexState() !== 'complete') {
+      throw new Error('Automatic sync is refused for an incomplete index; explicitly recover it or validate an independent candidate.');
+    }
+    const present = this.db.getDb().prepare(
+      'SELECT EXISTS(SELECT 1 FROM files) AS files, EXISTS(SELECT 1 FROM nodes) AS nodes'
+    ).get() as { files: number; nodes: number };
+    if (present.files !== present.nodes) {
+      throw new Error('Automatic sync is refused because file tracking and node data disagree; explicitly recover the existing graph.');
+    }
+  }
+
   /**
    * Start watching for file changes and auto-syncing.
    *
@@ -1579,12 +1614,14 @@ export class CodeGraph {
    * @returns true if watching started successfully
    */
   watch(options: WatchOptions = {}): boolean {
+    this.assertAutomaticSyncAllowed();
     if (this.watcher?.isActive()) return true;
 
     this.watcher = new FileWatcher(
       this.projectRoot,
       async (paths?: string[]) => {
-        const result = await this.sync({ paths });
+        this.assertAutomaticSyncAllowed();
+        const result = await this.syncAutomatically({ paths });
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },

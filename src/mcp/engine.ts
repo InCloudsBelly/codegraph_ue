@@ -408,6 +408,7 @@ export class MCPEngine {
     if (this.opts.readOnly || !this.cg || this.watcherStarted || !this.opts.watch) return;
 
     const opened = this.cg;
+    opened.assertAutomaticSyncAllowed();
     this.defaultLease = acquireProject(opened.getProjectRoot(), () => opened, this.watchOptions());
     this.cg = this.defaultLease.cg;
     if (this.cg !== opened) opened.close();
@@ -434,8 +435,11 @@ export class MCPEngine {
       this.toolHandler.setCatchUpGate(this.defaultLease.ready());
       return;
     }
-    const p = cg
-      .sync()
+    const p = Promise.resolve()
+      .then(() => {
+        cg.assertAutomaticSyncAllowed();
+        return cg.syncAutomatically();
+      })
       .then((result) => {
         const changed = result.filesAdded + result.filesModified + result.filesRemoved;
         if (changed > 0) {

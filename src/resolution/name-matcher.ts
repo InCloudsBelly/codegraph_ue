@@ -14404,74 +14404,135 @@ function cppLiteralEnd(text: string, start: number): number {
  * Is column `useColumn` of line `useLine` inside the body of the `for` whose
  * header opens at `lines[line][paren]`? A range-based for's variable is in
  * scope there and nowhere else: after the loop, or in a later function, the
- * same name is some other variable. The body runs to the `}` closing a braced
- * body, or to the end of its one statement — taken to be the first `;` or
- * closing `}` at its own depth, so an `else` after it is not counted.
+ * same name is some other variable. An unbraced body is one complete
+ * statement, including its nested controls and their own else branches.
  * Comments and literals are skipped, and a `for` inside one (commented-out
  * code, a code generator's template) has no body. A control initializer also
  * holds in its remaining header; an if initializer holds in its else body.
  */
 function cppForBodyEncloses(lines: readonly string[], line: number, paren: number, useLine: number, useColumn: number, initializer?: 'for' | 'if' | 'switch'): boolean {
-  let phase: 'before' | 'header' | 'gap' | 'block' | 'statement' | 'afterBody' = 'before';
-  let depth = 0;
-  let comment = false;
-  let elsePending = initializer === 'if';
-  for (let l = line; l <= useLine && l < lines.length; l++) {
-    const text = lines[l]!;
-    const end = l === useLine ? Math.min(useColumn, text.length) : text.length;
-    for (let c = 0; c < end; c++) {
-      const ch = text[c]!;
-      if (comment) {
-        if (ch === '*' && text[c + 1] === '/') {
-          comment = false;
-          c++;
+  type Token = { text: string; line: number; column: number };
+  // Read only the prefix through the use's token. Whole identifiers let the
+  // statement stack distinguish an `if` from a name containing that word.
+  function* tokens(): Generator<Token> {
+    let comment = false;
+    for (let l = line; l <= useLine && l < lines.length; l++) {
+      const text = lines[l]!;
+      for (let c = 0; c < text.length && (l !== useLine || c <= useColumn); c++) {
+        const ch = text[c]!;
+        if (comment) {
+          if (ch === '*' && text[c + 1] === '/') { comment = false; c++; }
+          continue;
         }
-        continue;
-      }
-      if (ch === '/' && text[c + 1] === '/') break;
-      if (ch === '/' && text[c + 1] === '*') {
-        comment = true;
-        c++;
-        continue;
-      }
-      // (A `'` after a digit separates digits: `1'000'000`.)
-      if (ch === '"' || (ch === '\'' && !/\d/.test(text[c - 1] ?? ''))) {
-        c = cppLiteralEnd(text, c);
-        continue;
-      }
-      if (phase === 'before') {
-        if (l === line && c === paren) {
-          phase = 'header';
-          depth = 1;
+        if (ch === '/' && text[c + 1] === '/') break;
+        if (ch === '/' && text[c + 1] === '*') { comment = true; c++; continue; }
+        // (A `'` after a digit separates digits: `1'000'000`.)
+        if (ch === '"' || (ch === '\'' && !/\d/.test(text[c - 1] ?? ''))) {
+          c = cppLiteralEnd(text, c);
+          continue;
         }
-        continue;
-      }
-      if (phase === 'header') {
-        if (ch === '(') depth++;
-        else if (ch === ')' && --depth === 0) phase = 'gap';
-        continue;
-      }
-      if (phase === 'afterBody') {
+        if (l === line && c < paren) continue;
         if (/\s/.test(ch)) continue;
-        if (!/^else\b/.test(text.slice(c))) return false;
-        elsePending = false;
-        phase = 'gap';
-        c += 3;
-        continue;
-      }
-      if (phase === 'gap') {
-        if (/\s/.test(ch)) continue;
-        phase = ch === '{' ? 'block' : 'statement';
-      }
-      if (ch === '(' || ch === '[' || ch === '{') depth++;
-      else if (ch === ')' || ch === ']') depth--;
-      else if ((ch === '}' && --depth <= 0) || (ch === ';' && depth <= 0 && phase === 'statement')) {
-        if (!elsePending) return false;
-        phase = 'afterBody';
+        const word = /[A-Za-z_]/.test(ch) ? /^[A-Za-z_]\w*/.exec(text.slice(c))![0] : ch === ':' && text[c + 1] === ':' ? '::' : ch;
+        yield { text: word, line: l, column: c };
+        c += word.length - 1;
       }
     }
   }
-  return phase !== 'before' && phase !== 'afterBody' && (phase !== 'header' || initializer !== undefined);
+  const stream = tokens();
+  let next = stream.next().value as Token | undefined;
+  let last: Token | undefined;
+  const peek = (): Token | undefined => next;
+  const take = (): Token | undefined => {
+    const token = next;
+    if (token) { last = token; next = stream.next().value as Token | undefined; }
+    return token;
+  };
+  const closeFor = (word: string): string | undefined => word === '(' ? ')' : word === '[' ? ']' : word === '{' ? '}' : undefined;
+  const balanced = (): 'closed' | 'incomplete' | 'invalid' => {
+    const first = take();
+    const close = first && closeFor(first.text);
+    if (!close) return 'invalid';
+    const closes = [close];
+    while (next) {
+      const word = take()!.text;
+      const nested = closeFor(word);
+      if (nested) closes.push(nested);
+      else if (word === ')' || word === ']' || word === '}') {
+        if (closes.pop() !== word) return 'invalid';
+        if (closes.length === 0) return 'closed';
+      }
+    }
+    return 'incomplete';
+  };
+  const opening = peek();
+  if (opening?.text !== '(' || opening.line !== line || opening.column !== paren) return false;
+  const header = balanced();
+  if (header !== 'closed') return header === 'incomplete' && initializer !== undefined;
+  if (last && (useLine < last.line || (useLine === last.line && useColumn <= last.column))) return initializer !== undefined;
+
+  // Continuations are stacked, so an inner if consumes its own else before
+  // its enclosing statement can finish. No recursion, and no scan past the
+  // use's line, even for deeply nested controls or an incomplete prefix.
+  const pending: Array<'statement' | 'else' | 'while'> = initializer === 'if' ? ['else', 'statement'] : ['statement'];
+  while (pending.length > 0) {
+    const action = pending.pop()!;
+    if (action === 'else') {
+      if (peek()?.text === 'else') { take(); pending.push('statement'); }
+      continue;
+    }
+    if (action === 'while') {
+      if (!peek()) return true;
+      if (take()!.text !== 'while' || peek()?.text !== '(') return false;
+      const condition = balanced();
+      if (condition !== 'closed') return condition === 'incomplete';
+      if (!peek()) return true;
+      if (take()!.text !== ';') return false;
+      continue;
+    }
+    // Statement attributes do not change its extent (`[[likely]] if (...)`).
+    while (peek()?.text === '[') {
+      const attribute = balanced();
+      if (attribute !== 'closed') return attribute === 'incomplete';
+    }
+    const statement = peek();
+    if (!statement) return true;
+    const word = statement.text;
+    if (word === '{') {
+      const block = balanced();
+      if (block !== 'closed') return block === 'incomplete';
+    } else if (word === 'if' || word === 'for' || word === 'while' || word === 'switch') {
+      take();
+      if (word === 'if' && peek()?.text === 'constexpr') take();
+      if (!peek()) return true;
+      if (peek()!.text !== '(') return false;
+      const condition = balanced();
+      if (condition !== 'closed') return condition === 'incomplete';
+      if (word === 'if') pending.push('else');
+      pending.push('statement');
+    } else if (word === 'do') {
+      take();
+      pending.push('while', 'statement');
+    } else {
+      // An unfamiliar compound statement must not hide a later global read.
+      if (word === 'try' || word === 'case' || word === 'default' || word === 'else' || word === '#') return false;
+      let conditional = 0;
+      for (;;) {
+        const token = peek();
+        if (!token) return true;
+        if (token.text === ';') { take(); break; }
+        if (closeFor(token.text)) {
+          const group = balanced();
+          if (group !== 'closed') return group === 'incomplete';
+        } else {
+          if (token.text === '?') conditional++;
+          else if ((token.text === ':' && --conditional < 0) || token.text === '}') return false;
+          take();
+        }
+      }
+    }
+  }
+  return !!last && (useLine < last.line || (useLine === last.line && useColumn < last.column + last.text.length));
 }
 
 /** What C++ receiver inference made of a receiver's declared type. */
@@ -16257,11 +16318,12 @@ const CPP_LOCAL_SPECIFIERS = String.raw`(?:(?:const|constexpr|static|volatile|th
 const CPP_LOCAL_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;={}]|<(?:[^<>;={}]|<[^<>;={}]*>)*>)*>`;
 const CPP_LOCAL_TYPE = String.raw`(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*${CPP_LOCAL_TEMPLATE_ARGUMENTS}(?:\s*::\s*[A-Za-z_]\w*)*)?`;
 // Where a statement starts: the line's start, a delimiter, or a for/if/switch header's `(`.
-const CPP_STATEMENT_START = String.raw`(?:^|[;{}]|\b(?:for|if|switch)\s*\()\s*`;
+const CPP_STATEMENT_START = String.raw`(?:^|[;{}]|\b(?:for|if(?:\s+constexpr)?|switch)\s*\()\s*`;
 // Declarations that start a statement, the declared name captured: `auto key = …`, `Formatter format(p);`,
 // `const Formatter& format = …`, and the local types `using V = …;`, `typedef … V;`, `struct Getter {`.
 const CPP_AUTO_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}auto(?:\s+|\s*[*&]+\s*)([A-Za-z_]\w*)\s*(?:=|\{|\()`, 'g');
-const CPP_TYPED_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}(${CPP_LOCAL_TYPE})(\s+|\s*[*&]+\s*)(?:const\s+)?([A-Za-z_]\w*)\s*([=({;[,])`, 'g');
+// Do not consume `if constexpr (` as a declaration before trying its initializer.
+const CPP_TYPED_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}((?!(?:for|if|switch)\b)${CPP_LOCAL_TYPE})(\s+|\s*[*&]+\s*)(?:const\s+)?([A-Za-z_]\w*)\s*([=({;[,])`, 'g');
 const CPP_LOCAL_TYPE_DECLARATION = new RegExp(String.raw`${CPP_STATEMENT_START}(?:using\s+([A-Za-z_]\w*)\s*=|typedef\b[^;]*?\b([A-Za-z_]\w*)\s*;|(?:struct|class|union|enum)(?:\s+class)?\s+([A-Za-z_]\w*)\b)`, 'g');
 // A lambda's head, its parameters captured: `[&](const Foo& f) mutable -> bool {`.
 const CPP_LAMBDA_HEAD = /\]\s*\(([^()]*)\)\s*(?:mutable\s*)?(?:->[^{;]*)?\{/g;
@@ -16288,18 +16350,38 @@ interface CppLocalBinding {
   /** For a range-`for` variable: the column of the loop header's `(`, whose body is its scope. */
   loopParen?: number;
   /** An initializer's variable also holds in the control header, and ends with that statement. */
-  control?: { kind: 'for' | 'if' | 'switch'; paren: number };
+  control?: { kind: 'for' | 'if' | 'switch'; line: number; paren: number };
 }
 
 const CPP_LOCAL_BINDINGS = new WeakMap<ResolutionContext, Map<string, CppLocalBinding[]>>();
 const CPP_CALLER_HEADS = new WeakMap<ResolutionContext, Map<string, { parameters: Set<string>; body: number }>>();
 
-/** The control header this declaration starts, including a later name in its declarator list. */
-function cppLocalControl(text: string, declaration: RegExpExecArray | RegExpMatchArray): CppLocalBinding['control'] {
-  const own = /^\s*(for|if|switch)\s*\(/.exec(declaration[0]);
-  if (own) return { kind: own[1] as 'for' | 'if' | 'switch', paren: declaration.index! + own[0].lastIndexOf('(') };
-  const before = /\b(for|if|switch)\s*\(\s*$/.exec(text.slice(0, declaration.index));
-  return before ? { kind: before[1] as 'for' | 'if' | 'switch', paren: before.index + before[0].lastIndexOf('(') } : undefined;
+/** The control header directly enclosing a declaration, including a header that opens on an earlier line. */
+function cppLocalControl(codeLine: (line: number) => string, line: number, column: number, first: number): CppLocalBinding['control'] {
+  const closing: string[] = [];
+  for (let l = line; l >= first; l--) {
+    const text = codeLine(l);
+    for (let c = (l === line ? column : text.length) - 1; c >= 0; c--) {
+      const ch = text[c]!;
+      if (ch === ')' || ch === ']' || ch === '}') closing.push(ch);
+      else if (ch === '(' || ch === '[' || ch === '{') {
+        if (closing.length > 0) {
+          if (closing.pop() !== ({ '(': ')', '[': ']', '{': '}' } as Record<string, string>)[ch]) return undefined;
+          continue;
+        }
+        // A lambda body or an ordinary block owns its declarations; a call's
+        // argument list is not a control initializer either.
+        if (ch !== '(') return undefined;
+        let before = text.slice(0, c);
+        for (let k = l - 1; k >= first && (before.trim() === '' || /^\s*constexpr\s*$/.test(before)); k--) {
+          before = `${codeLine(k)}\n${before}`;
+        }
+        const head = /\b(for|if|switch)(?:\s+constexpr)?\s*$/.exec(before);
+        return head ? { kind: head[1] as 'for' | 'if' | 'switch', line: l, paren: c } : undefined;
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -16407,12 +16489,23 @@ function cppLocalBindings(
       if ((m[1] ?? m[2] ?? m[3]) === name && starts(m.index)) bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind: 'type' });
     }
     for (const m of text.matchAll(CPP_AUTO_LOCAL)) {
-      if (m[1] === name && starts(m.index)) bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind: 'variable', control: cppLocalControl(text, m) });
+      if (m[1] !== name) continue;
+      const column = m.index + m[0].lastIndexOf(name);
+      const control = cppLocalControl(codeLine, l, column, head.body);
+      if (starts(m.index) || control) bindings.push({ line: l, column, kind: 'variable', control });
     }
     for (const m of text.matchAll(CPP_TYPED_LOCAL)) {
       const type = m[1]!;
-      if (m[3] !== name || !starts(m.index) || CPP_NOT_A_DECLARED_TYPE.has(type.split(/[\s<:]/)[0]!) ||
+      if (m[3] !== name || CPP_NOT_A_DECLARED_TYPE.has(type.split(/[\s<:]/)[0]!) ||
           /^(?:using|typedef|struct|class|union|enum|auto)$/.test(type)) continue;
+      const column = m.index + m[0].lastIndexOf(name);
+      const control = cppLocalControl(codeLine, l, column, head.body);
+      if (!starts(m.index) && !control) continue;
+      // `Factor * Product;`, `Mask & Product, condition` and an indexed
+      // operand also read as uninitialized pointer/reference declarations.
+      // Without type evidence retain their possible global references.
+      const delimiter = m[4]!;
+      if (control && /[*&]/.test(m[2]!) && (delimiter === ',' || delimiter === ';' || delimiter === '[')) continue;
       let kind: CppLocalBinding['kind'] = 'variable';
       if (m[4] === '(') {
         // `a && f(x)` and `a * f(x)` are expressions.
@@ -16421,11 +16514,19 @@ function cppLocalBindings(
       }
       // The statement pattern may include its opening `{`; starting at the
       // name keeps that enclosing block's `}` from being counted as still open.
-      bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind, control: cppLocalControl(text, m) });
+      bindings.push({ line: l, column, kind, control });
     }
     if (text.includes(',')) {
       const m = cppListedDeclaratorOn(text, name);
-      if (m && starts(m.index)) bindings.push({ line: l, column: m.index + m[0].lastIndexOf(name), kind: 'variable', control: cppLocalControl(text, m) });
+      if (m) {
+        const column = m.index + m[0].lastIndexOf(name);
+        const control = cppLocalControl(codeLine, l, column, head.body);
+        // The first entry may instead be a multiplication/bitwise expression;
+        // a later comma operand must not become a declaration either.
+        const leading = control && m[0].matchAll(CPP_TYPED_LOCAL).next().value;
+        const ambiguous = leading && /[*&]/.test(leading[2]!) && (leading[4] === ',' || leading[4] === ';' || leading[4] === '[');
+        if (!ambiguous && (starts(m.index) || control)) bindings.push({ line: l, column, kind: 'variable', control });
+      }
     }
     const loop = cppRangeForDeclaration(text, name);
     if (loop) bindings.push({ line: l, column: loop.paren, kind: 'variable', loopParen: loop.paren });
@@ -16492,7 +16593,7 @@ export function isCppLocalValueRef(ref: UnresolvedRef, context: ResolutionContex
     if (b.line > callLine || (b.line === callLine && b.column >= ref.column)) continue;
     const inScope = b.kind === 'parameter' ||
       (b.control !== undefined
-        ? cppForBodyEncloses(rawLines, b.line, b.control.paren, callLine, ref.column, b.control.kind)
+        ? cppForBodyEncloses(rawLines, b.control.line, b.control.paren, callLine, ref.column, b.control.kind)
         : b.loopParen !== undefined
         ? cppForBodyEncloses(rawLines, b.line, b.loopParen, callLine, ref.column)
         : cppBlockReaches(codeLine, b.line, b.column, callLine, ref.column));

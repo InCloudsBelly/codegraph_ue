@@ -111,6 +111,7 @@ function ready(root: string, project: Project): Promise<void> {
 
 async function activate(root: string, project: Project): Promise<void> {
   if (!isInitialized(root)) return;
+  project.cg.assertAutomaticSyncAllowed();
   const writer = tryAcquireWriterLock(root, 'fallback');
   if (writer.kind === 'taken') {
     // Keep a real daemon session, so its idle timeout cannot strand this reader.
@@ -152,7 +153,7 @@ async function activate(root: string, project: Project): Promise<void> {
       process.stderr.write(`[CodeGraph MCP] File watcher active for ${root} — graph will auto-sync on changes\n`);
     }
   }
-  await project.cg.sync();
+  await project.cg.syncAutomatically();
   project.caughtUp = true;
   markWriterReady(root);
 }

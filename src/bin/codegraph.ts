@@ -53,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, assertNoExistingIndexArtifacts, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, assertNoExistingIndexArtifacts, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { getIndexingConfigStatus } from '../indexing-config';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
@@ -711,17 +711,7 @@ async function runInit(
       return;
     }
 
-    if (hasForeignDbFile(projectPath)) {
-      const dbFile = path.join(getCodeGraphDir(projectPath), 'codegraph.db');
-      clack.log.error(`${dbFile} is not a SQLite database, so it cannot be rebuilt in place.`);
-      clack.log.info('Move or delete that file, then run "codegraph init" again.');
-      clack.outro('');
-      process.exitCode = 1;
-      return;
-    }
-    if (hasSchemalessDb(projectPath)) {
-      clack.log.warn(`Found a codegraph.db without the codegraph schema in ${getCodeGraphDir(projectPath)} (left by an interrupted init?) — rebuilding it.`);
-    }
+    assertNoExistingIndexArtifacts(projectPath);
     const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
     const cg = await CodeGraph.init(projectPath, { index: false });
     clack.log.success(`Initialized in ${projectPath}`);

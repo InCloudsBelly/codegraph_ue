@@ -138,9 +138,11 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
   });
 
   it('the cache follows the file: a db that gains its schema flips to initialized', async () => {
-    plantBrokenDb(parent, 'no-tables');
+    const broken = plantBrokenDb(parent, 'no-tables');
     expect(isInitialized(parent)).toBe(false);
-    await indexProject(parent); // repairs the file in place
+    // Explicit fixture replacement preserves the unknown file; init may not repair it in place.
+    fs.renameSync(broken, broken + '.preserved');
+    await indexProject(parent);
     expect(isInitialized(parent)).toBe(true);
   });
 
@@ -192,27 +194,30 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
     expect(text).not.toMatch(/SQLITE_|not a database|no such table/i);
   });
 
-  it('(d) codegraph init in the directory with the broken file repairs it', () => {
+  it('(d) codegraph init preserves a schema-less database and requires explicit recovery', () => {
     const dbPath = plantBrokenDb(parent, 'no-tables');
+    const before = fs.readFileSync(dbPath);
     fs.writeFileSync(path.join(parent, 'a.py'), 'def alpha():\n    return 1\n');
     const r = run(parent, ['init', '--yes']);
-    expect(r.status).toBe(0);
-    expect(r.out).toContain('without the codegraph schema');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('preserving existing index');
     expect(r.out).not.toContain('Already initialized');
-    expect(isInitialized(parent)).toBe(true);
+    expect(isInitialized(parent)).toBe(false);
+    expect(fs.readFileSync(dbPath)).toEqual(before);
     const db = new DatabaseSync(dbPath, { readOnly: true });
     const row = db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get() as { c: number };
     db.close();
-    expect(row.c).toBe(1);
+    expect(row.c).toBe(0);
   });
 
-  it('(d) an empty file is repaired too; a file that is not SQLite is refused with guidance and left alone', () => {
-    plantBrokenDb(parent, 'empty');
+  it('(d) empty and non-SQLite files are refused with guidance and left alone', () => {
+    const emptyPath = plantBrokenDb(parent, 'empty');
     fs.writeFileSync(path.join(parent, 'a.py'), 'def alpha():\n    return 1\n');
     const empty = run(parent, ['init', '--yes']);
-    expect(empty.status).toBe(0);
-    expect(empty.out).toContain('without the codegraph schema');
-    expect(isInitialized(parent)).toBe(true);
+    expect(empty.status).toBe(1);
+    expect(empty.out).toContain('preserving existing index');
+    expect(isInitialized(parent)).toBe(false);
+    expect(fs.readFileSync(emptyPath).length).toBe(0);
 
     for (const bytes of ['x'.repeat(4096), 'hello']) {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1895-foreign-'));
@@ -224,7 +229,7 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
         fs.writeFileSync(path.join(dir, 'a.py'), 'def alpha():\n    return 1\n');
         const r = run(dir, ['init', '--yes']);
         expect(r.status).toBe(1);
-        expect(r.out).toContain('is not a SQLite database');
+        expect(r.out).toContain('preserving existing index');
         expect(r.out).not.toContain('rebuilding');
         expect(r.out).not.toContain('file is not a database');
         // Nothing is deleted or rewritten behind the user's back.
