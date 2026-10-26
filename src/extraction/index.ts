@@ -3649,6 +3649,7 @@ export class ExtractionOrchestrator {
 
     const filesToIndex: string[] = [];
     const failedFilePaths: string[] = [];
+    const refreshedObservations: FileRecord[] = [];
     // === Filesystem reconcile (git-independent) ===
     // The source of truth for "what changed" is the filesystem vs the indexed
     // state — never git. We enumerate the current source files and reconcile
@@ -3824,6 +3825,12 @@ export class ExtractionOrchestrator {
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesModified++;
+      } else if (tracked.size <= MAX_SOURCE_FILE_SIZE_BYTES && scan.fileStats.get(filePath)!.size <= MAX_SOURCE_FILE_SIZE_BYTES) {
+        // A checkout/touch can change stat metadata without changing source.
+        // Keep the hash-verified observation so Windows access notifications
+        // stop looking like edits; no nodes or relationships need replacing.
+        const stat = scan.fileStats.get(filePath)!;
+        refreshedObservations.push({ ...tracked, size: stat.size, modifiedAt: stat.mtimeMs });
       }
     }
 
@@ -3878,6 +3885,24 @@ export class ExtractionOrchestrator {
     for (const pair of pairsBefore) if (!pairsAfter.has(pair)) deltaNames.add(nameOf(pair));
     for (const pair of pairsAfter) if (!pairsBefore.has(pair)) deltaNames.add(nameOf(pair));
     const definitionDelta = [...deltaNames];
+
+    if (failedFilePaths.length === 0) {
+      const verifiedObservations: FileRecord[] = [];
+      let checkedObservations = 0;
+      for (const observed of refreshedObservations) {
+        // Do not certify a file that changed between discovery and hashing.
+        const current = scanFileStat(path.join(this.rootDir, observed.path));
+        if (current?.isFile() && current.size === observed.size && current.mtimeMs === observed.modifiedAt) {
+          verifiedObservations.push(observed);
+        }
+        if (++checkedObservations % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+      }
+      this.queries.runInTransaction(() => {
+        for (const observed of verifiedObservations) this.queries.upsertFile(observed);
+      });
+    }
 
     return {
       filesChecked,

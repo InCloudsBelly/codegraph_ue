@@ -1276,7 +1276,7 @@ describe('FileWatcher', () => {
       await waitFor(() => !has('scopeEdited'), 8000);
     }, 30000);
 
-    it('bounds watch handles, skips ignored targets and closes every handle on stop', () => {
+    it('bounds watch handles, skips ignored targets and closes every handle on stop', async () => {
       const dir = external();
       link(dir, path.join(testDir, 'linked'));
       link(dir, path.join(testDir, 'duplicate'));
@@ -1295,6 +1295,7 @@ describe('FileWatcher', () => {
       watchers.push(watcher);
       expect(watcher.start()).toBe(true);
       expect(opened.some(d => d.includes('node_modules'))).toBe(false);
+      await watcher.waitUntilReady();
       const realpath = process.platform === 'win32' ? fs.realpathSync.native : fs.realpathSync;
       expect(opened.filter(d => realpath(d) === realpath(dir))).toHaveLength(1);
       watcher.stop();
@@ -1304,7 +1305,7 @@ describe('FileWatcher', () => {
       expect(closed.sort()).toEqual(opened.sort());
     });
 
-    it.runIf(process.platform === 'darwin' || process.platform === 'win32')('caps supplemental recursive streams and degrades on their exhaustion', () => {
+    it.runIf(process.platform === 'darwin' || process.platform === 'win32')('caps supplemental recursive streams and degrades on their exhaustion', async () => {
       link(external(), path.join(testDir, 'first'));
       link(external(), path.join(testDir, 'second'));
       vi.stubEnv('CODEGRAPH_MAX_DIR_WATCHES', '1');
@@ -1318,6 +1319,7 @@ describe('FileWatcher', () => {
       const watcher = new FileWatcher(testDir, async () => ({ filesChanged: 0, durationMs: 0 }));
       watchers.push(watcher);
       expect(watcher.start()).toBe(true);
+      await watcher.waitUntilReady();
       expect(watch).toHaveBeenCalledTimes(2); // root + capped supplemental stream
       watcher.stop();
       expect(close).toHaveBeenCalledTimes(2);
@@ -1326,7 +1328,8 @@ describe('FileWatcher', () => {
         w.close = close;
         return w;
       }).mockImplementation(() => { throw Object.assign(new Error('EMFILE'), { code: 'EMFILE' }); });
-      expect(watcher.start()).toBe(false);
+      expect(watcher.start()).toBe(true);
+      await expect(watcher.waitUntilReady()).rejects.toThrow(/stopped/i);
       expect(watcher.isDegraded()).toBe(true);
       expect(close).toHaveBeenCalledTimes(3);
     });

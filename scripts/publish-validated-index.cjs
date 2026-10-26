@@ -24,7 +24,10 @@ function assertConsumerRecords(records, selfPid = process.pid) {
 function assertNoGraphConsumers() {
   if (process.platform !== 'win32') throw new Error('The consumer guard currently supports Windows only.');
   const script = "$ErrorActionPreference='Stop'; @([object[]](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -match '^(node|codegraph)(\\.exe)?$' } | Select-Object Name,ProcessId,CommandLine)) | ConvertTo-Json -Compress";
-  const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', windowsHide: true });
+  // Capture diagnostic/progress output; Node otherwise forwards successful
+  // PowerShell CLIXML to an outer PowerShell host as if it were our stderr.
+  // A nonzero exit still throws with the captured diagnostics attached.
+  const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const parsed = JSON.parse(output.trim());
   assertConsumerRecords(Array.isArray(parsed) ? parsed : parsed ? [parsed] : []);
 }

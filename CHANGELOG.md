@@ -26,6 +26,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Windows 和 macOS 的链接目录监听在后台发现拓扑，大型工作区启动及目录变化时仍可处理查询，并保留发现期间的编辑。
+- 源码内容未变、只有时间戳变化时，增量同步会刷新已验证的文件记录，避免 Windows 读访问反复触发待同步提示。
+- Windows 索引发布保留子进程的真实失败诊断，同时避免 PowerShell 进度记录被误报为 XML 错误。
 - 大型工作区的普通 Git 忽略目录使用更快的路径查找，保留特殊模式和否定规则的既有语义。
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
 - In React, a component rendered at module scope, in a top-level constant or inside a test's `it(…)` callback, like `createRoot(el).render(<App />)` or `render(<Card />)`, now counts as rendered there, so an app's entry reaches its root component and a component's tests show among its callers. (#2587)

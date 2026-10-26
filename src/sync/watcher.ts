@@ -310,6 +310,9 @@ export class FileWatcher {
   private knownDirs = new Map<string, string>();
   private watchedRealDirs = new Map<string, string>();
   private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private treeScan: Promise<void> | null = null;
+  private treeScanAgain = false;
+  private watchGeneration = 0;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * True when the pending set does NOT exactly describe the change (a
@@ -336,12 +339,9 @@ export class FileWatcher {
   private syncing = false;
   private stopped = false;
   /**
-   * True once the initial watch set is established. Unlike the previous
-   * chokidar implementation there is no asynchronous initial "crawl" emitting
-   * an `add` per existing file — `fs.watch` only reports changes from the
-   * moment it's installed — so this flips to true synchronously at the end of
-   * `start()`. The startup reconcile against on-disk state is handled
-   * separately by the engine's catch-up sync, not by the watcher.
+   * True once the initial watch set, including supplemental linked roots,
+   * is established. The recursive stream retains edits while its supplemental
+   * topology is discovered asynchronously.
    */
   private ready = false;
   /**
@@ -349,7 +349,7 @@ export class FileWatcher {
    * (and any production caller that cares about a clean baseline) to
    * deterministically gate on watcher readiness.
    */
-  private readyWaiters: Array<() => void> = [];
+  private readyWaiters: Array<(error?: Error) => void> = [];
   // The shared scope matcher from `buildScopeIgnore` (built-in defaults +
   // root `.gitignore` + `.git/info/exclude` + `core.excludesFile` + dirs
   // `git ls-files --exclude-standard` reports ignored + `codegraph.json`
@@ -401,6 +401,9 @@ export class FileWatcher {
   start(): boolean {
     if (this.recursiveWatcher || this.dirWatchers.size > 0 || this.inert) return true; // Already watching
     this.stopped = false;
+    this.watchGeneration++;
+    this.ready = false;
+    this.pendingFiles.clear();
     this.degradedReason = null;
     this.degradedByLock = false;
     this.recoveringFromLock = false;
@@ -437,13 +440,7 @@ export class FileWatcher {
       // strategies report exhaustion identically (start() === false).
       if (this.degradedReason) return false;
 
-      // No async crawl to wait on: as soon as the watch set is installed we
-      // have a clean baseline (pendingFiles is only populated by post-start
-      // events). Clear defensively and flip ready.
-      this.pendingFiles.clear();
-      this.ready = true;
-      for (const cb of this.readyWaiters) cb();
-      this.readyWaiters.length = 0;
+      if (this.inertForTests || !supportsRecursiveWatch()) this.markReady();
       if (IS_TEST_RUNTIME) liveWatchersForTests.set(this.projectRoot, this);
 
       logDebug('File watcher started', {
@@ -500,20 +497,99 @@ export class FileWatcher {
    * it maps straight to a project-relative path.
    */
   private startRecursive(): void {
+    const generation = this.watchGeneration;
     const watchRoot = process.platform === 'win32' ? fs.realpathSync.native(this.projectRoot) : this.projectRoot;
     this.recursiveWatcher = watchImpl(
       watchRoot,
       { recursive: true, persistent: true },
-      (_event, filename) => this.handleDirEvent(this.projectRoot, filename)
+      (_event, filename) => {
+        if (generation === this.watchGeneration) this.handleDirEvent(this.projectRoot, filename);
+      }
     );
     this.recursiveWatcher.on('error', (err: unknown) => {
+      if (generation !== this.watchGeneration) return;
       if (isWatchResourceExhaustion(err)) {
         this.degrade(EXHAUSTION_REASON, { error: String(err) });
         return;
       }
       logWarn('File watcher error', { error: String(err) });
     });
-    this.refreshWatchTree();
+    this.refreshRecursiveWatchTree();
+  }
+
+  /** Supplemental discovery must never monopolize the MCP transport thread. */
+  private refreshRecursiveWatchTree(): void {
+    if (this.stopped || this.inert) return;
+    if (this.treeScan) { this.treeScanAgain = true; return; }
+    const generation = this.watchGeneration;
+    const current = () => !this.stopped && generation === this.watchGeneration;
+    const topologyChanged = this.ready;
+    let supplemental = false;
+    let operation: Promise<void>;
+    operation = (async () => {
+      do {
+        this.treeScanAgain = false;
+        const matcher = this.ignoreMatcher;
+        const visited = new Set<string>();
+        const directories = new Map<string, string>();
+        const desired = new Map<string, string>();
+        const walk = async (dir: string, linked: boolean): Promise<void> => {
+          if (!current() || this.shouldIgnoreDir(dir, matcher)) return;
+          try {
+            const real = await fs.promises.realpath(dir);
+            if (!current() || visited.has(real)) return;
+            visited.add(real);
+            directories.set(dir, real);
+            if (linked) desired.set(dir, real);
+            const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            if (!current()) return;
+            for (const entry of entries) {
+              if (!current()) return;
+              const child = path.join(dir, entry.name);
+              if (entry.isDirectory()) await walk(child, false);
+              else if (entry.isSymbolicLink()) {
+                try {
+                  const stat = await fs.promises.stat(child);
+                  if (!current()) return;
+                  if (stat.isDirectory()) await walk(child, true);
+                } catch { /* broken link */ }
+              }
+            }
+          } catch { /* removed or unreadable directory */ }
+        };
+        await walk(this.projectRoot, false);
+        if (!current()) return;
+        if (matcher !== this.ignoreMatcher) { this.treeScanAgain = true; continue; }
+        this.knownDirs = directories;
+        for (const dir of this.dirWatchers.keys()) {
+          if (!current()) return;
+          if (desired.get(dir) !== this.watchedRealDirs.get(dir)) this.unwatchDir(dir);
+        }
+        for (const [dir, real] of desired) {
+          if (!current()) return;
+          this.watchDirectory(dir, real, true);
+          supplemental = true;
+        }
+      } while (current() && this.treeScanAgain);
+      if (!current()) return;
+      // Cover edits made before a supplemental stream was installed with an
+      // ordinary incremental scan-diff, never a graph rebuild.
+      if (topologyChanged || supplemental) this.needsFullScan = true;
+      this.markReady();
+    })().catch(error => {
+      if (!current()) return;
+      if (isWatchResourceExhaustion(error)) this.degrade(EXHAUSTION_REASON, { error: String(error) });
+      else { logWarn('Could not refresh file watcher topology', { error: String(error) }); this.stop(); }
+    }).finally(() => {
+      if (this.treeScan === operation) this.treeScan = null;
+    });
+    this.treeScan = operation;
+  }
+
+  private markReady(): void {
+    this.ready = true;
+    for (const cb of this.readyWaiters.splice(0)) cb();
+    if (this.pendingFiles.size > 0 || this.needsFullScan) this.scheduleSync();
   }
 
   /** Reconcile logical directory paths with real targets, including retargeted links. */
@@ -557,8 +633,12 @@ export class FileWatcher {
   /** Coalesce directory topology events before walking; file edits never walk the tree. */
   private scheduleTreeRefresh(): void {
     if (this.treeRefreshTimer || this.inert || this.stopped) return;
+    this.needsFullScan = true;
+    const generation = this.watchGeneration;
     this.treeRefreshTimer = setTimeout(() => {
+      if (this.stopped || generation !== this.watchGeneration) return;
       this.treeRefreshTimer = null;
+      if (supportsRecursiveWatch()) { this.refreshRecursiveWatchTree(); return; }
       this.refreshWatchTree();
       if (this.stopped) return;
       // A new/retargeted directory can already contain files before its watch
@@ -582,14 +662,17 @@ export class FileWatcher {
       return;
     }
 
+    const generation = this.watchGeneration;
     let w: fs.FSWatcher;
     try {
       // libuv can abort on a Windows junction's logical/8.3 path (#770).
       // Watch its canonical target and keep events mapped to the logical dir.
       const watchPath = process.platform === 'win32' ? fs.realpathSync.native(dir) : dir;
-      w = watchImpl(watchPath, { persistent: true, recursive }, (_event, filename) =>
-        this.handleDirEvent(dir, filename)
-      );
+      w = watchImpl(watchPath, { persistent: true, recursive }, (_event, filename) => {
+        if (generation === this.watchGeneration && w && this.dirWatchers.get(dir) === w) {
+          this.handleDirEvent(dir, filename);
+        }
+      });
     } catch (err) {
       // EMFILE/ENFILE means the PROCESS is out of descriptors — every further
       // directory would fail too, so degrade the whole watcher rather than
@@ -605,6 +688,7 @@ export class FileWatcher {
       return;
     }
     w.on('error', (err: unknown) => {
+      if (generation !== this.watchGeneration || this.dirWatchers.get(dir) !== w) return;
       if (isWatchResourceExhaustion(err)) {
         this.degrade(EXHAUSTION_REASON, { error: String(err), dir });
         return;
@@ -659,6 +743,7 @@ export class FileWatcher {
    * — it drops node_modules/dist/.git churn before any sync is scheduled.
    */
   private handleChange(rel: string): void {
+    if (this.stopped) return;
     if (!rel || rel === '.' || rel.startsWith('..')) return;
     if (rel === this.indexingConfigRelative) {
       this.refreshScope(rel);
@@ -711,14 +796,12 @@ export class FileWatcher {
     }
 
     logDebug('File change detected', { file: rel });
-    if (this.ready) {
-      const now = Date.now();
-      const existing = this.pendingFiles.get(rel);
-      this.pendingFiles.set(rel, {
-        firstSeenMs: existing?.firstSeenMs ?? now,
-        lastSeenMs: now,
-      });
-    }
+    const now = Date.now();
+    const existing = this.pendingFiles.get(rel);
+    this.pendingFiles.set(rel, {
+      firstSeenMs: existing?.firstSeenMs ?? now,
+      lastSeenMs: now,
+    });
     this.scheduleSync();
   }
 
@@ -814,12 +897,12 @@ export class FileWatcher {
    * Linux per-directory watch tree). Tests the directory form of the path so a
    * dir-only ignore rule like `build/` matches.
    */
-  private shouldIgnoreDir(dirPath: string): boolean {
+  private shouldIgnoreDir(dirPath: string, matcher = this.ignoreMatcher): boolean {
     const rel = normalizePath(path.relative(this.projectRoot, dirPath));
     if (!rel || rel === '.' || rel.startsWith('..')) return false; // root / outside
     if (this.isAlwaysIgnored(rel)) return true;
-    if (!this.ignoreMatcher) return false;
-    return this.ignoreMatcher.ignores(rel + '/');
+    if (!matcher) return false;
+    return matcher.ignores(rel + '/');
   }
 
   /**
@@ -908,6 +991,10 @@ export class FileWatcher {
    */
   stop(): void {
     this.stopped = true;
+    this.watchGeneration++;
+    this.treeScan = null;
+    this.treeScanAgain = false;
+    for (const cb of this.readyWaiters.splice(0)) cb(new Error('FileWatcher stopped before readiness'));
     if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
     this.treeRefreshTimer = null;
     this.knownDirs.clear();
@@ -978,9 +1065,8 @@ export class FileWatcher {
    * already has). Useful for tests that need a deterministic boundary before
    * asserting on `pendingFiles`.
    *
-   * Production callers don't need this: `pendingFiles` is read continuously,
-   * the staleness banner is always correct (empty or populated), and there is
-   * no asynchronous initial-scan window with `fs.watch`.
+   * Startup edits remain pending before readiness. A stopped generation
+   * rejects its waiters rather than waking them during a later restart.
    */
   waitUntilReady(timeoutMs = 10000): Promise<void> {
     if (this.ready) return Promise.resolve();
@@ -990,7 +1076,7 @@ export class FileWatcher {
         if (idx >= 0) this.readyWaiters.splice(idx, 1);
         reject(new Error(`FileWatcher.waitUntilReady timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      const handler = () => { clearTimeout(t); resolve(); };
+      const handler = (error?: Error) => { clearTimeout(t); if (error) reject(error); else resolve(); };
       this.readyWaiters.push(handler);
     });
   }
@@ -1047,7 +1133,7 @@ export class FileWatcher {
    */
   private async flush(): Promise<void> {
     // If already syncing, the post-sync check will re-trigger
-    if (this.syncing || this.stopped) return;
+    if (this.syncing || this.stopped || !this.ready) return;
 
     this.syncStartedMs = Date.now();
     this.syncing = true;

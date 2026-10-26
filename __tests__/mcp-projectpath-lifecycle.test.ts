@@ -142,8 +142,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
     const script = `
       if (process.env.CG_TEST_HOLD_CATCHUP) {
         const CodeGraph = require(process.argv[1] + '/../index').default;
-        const sync = CodeGraph.prototype.sync;
-        CodeGraph.prototype.sync = async function (...args) {
+        const sync = CodeGraph.prototype.syncAutomatically;
+        CodeGraph.prototype.syncAutomatically = async function (...args) {
           process.send('ready');
           await new Promise((resolve) => setTimeout(resolve, 300));
           return sync.apply(this, args);
@@ -290,8 +290,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     onOpen = (cg) => {
-      const sync = cg.sync.bind(cg);
-      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+      const sync = cg.syncAutomatically.bind(cg);
+      vi.spyOn(cg, 'syncAutomatically').mockImplementation(async (...args) => { await held; return sync(...args); });
     };
     fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function concurrentNew() {}\n');
     const second = new MCPEngine();
@@ -309,7 +309,7 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
     } finally { release(); }
     await Promise.all(calls);
     expect(names(serviceA)).toEqual(['concurrentNew']);
-    expect(opened[0]!.sync).toHaveBeenCalledTimes(1);
+    expect(opened[0]!.syncAutomatically).toHaveBeenCalledTimes(1);
   });
 
   it('keeps watching after one of two engines releases its lease', async () => {
@@ -410,8 +410,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
     const held = new Promise<void>((resolve) => { release = resolve; });
     onOpen = (cg) => {
       if (cg.getProjectRoot() !== serviceA) return;
-      const sync = cg.sync.bind(cg);
-      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+      const sync = cg.syncAutomatically.bind(cg);
+      vi.spyOn(cg, 'syncAutomatically').mockImplementation(async (...args) => { await held; return sync(...args); });
     };
     const prev = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
     process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '10';
@@ -473,8 +473,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     onOpen = (cg) => {
-      const sync = cg.sync.bind(cg);
-      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+      const sync = cg.syncAutomatically.bind(cg);
+      vi.spyOn(cg, 'syncAutomatically').mockImplementation(async (...args) => { await held; return sync(...args); });
     };
     const prevIdle = process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
     process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS = '50';
