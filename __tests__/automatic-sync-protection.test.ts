@@ -28,10 +28,13 @@ describe('automatic catch-up never repairs an incomplete graph by reindexing the
   function breakIndex(state: string) {
     if (state === 'empty-nodes') (cg as any).db.getDb().exec('DELETE FROM nodes');
     else if (state === 'empty-files') (cg as any).db.getDb().exec('DELETE FROM files');
+    else if (state === 'older-extraction') (cg as any).queries.setMetadata('indexed_with_extraction_version', '0');
+    else if (state === 'newer-extraction') (cg as any).queries.setMetadata('indexed_with_extraction_version', '999999');
+    else if (state === 'missing-extraction') (cg as any).db.getDb().prepare("DELETE FROM project_metadata WHERE key='indexed_with_extraction_version'").run();
     else (cg as any).queries.setMetadata('index_state', state);
   }
 
-  it.each(['partial', 'failed', 'indexing', 'unknown', 'empty-nodes', 'empty-files'])(
+  it.each(['partial', 'failed', 'indexing', 'unknown', 'empty-nodes', 'empty-files', 'older-extraction', 'newer-extraction', 'missing-extraction'])(
     'MCP project activation never starts watching or syncing a %s index', async state => {
       breakIndex(state);
       const watch = vi.spyOn(cg, 'watch').mockReturnValue(false);
@@ -47,7 +50,7 @@ describe('automatic catch-up never repairs an incomplete graph by reindexing the
     },
   );
 
-  it.each(['partial', 'failed', 'indexing', 'unknown', 'empty-nodes', 'empty-files'])(
+  it.each(['partial', 'failed', 'indexing', 'unknown', 'empty-nodes', 'empty-files', 'older-extraction', 'newer-extraction', 'missing-extraction'])(
     'direct MCP catch-up never syncs a %s index', async state => {
       breakIndex(state);
       const sync = vi.spyOn(cg, 'sync').mockResolvedValue({ filesAdded: 0, filesModified: 0, filesRemoved: 0 } as any);
@@ -83,7 +86,7 @@ describe('automatic catch-up never repairs an incomplete graph by reindexing the
     expect(cg.getStats().fileCount).toBe(1);
   });
 
-  it.each(['empty-nodes', 'empty-files'])('an already active watcher refuses a graph that later becomes %s', async state => {
+  it.each(['empty-nodes', 'empty-files', 'older-extraction', 'newer-extraction', 'missing-extraction'])('an already active watcher refuses a graph that later becomes %s', async state => {
     let report!: (value: string) => void;
     const reported = new Promise<string>(resolve => { report = resolve; });
     expect(cg.watch({ inertForTests: true, debounceMs: 20,

@@ -73,12 +73,12 @@ describe('metadata-only CLI status', () => {
     expect(human).not.toContain('Index is up to date');
   }, 30_000);
 
-  it('retains invalid-config, extraction-version and pending-reference gates in metadata', async () => {
+  it.each(['0', '999999'])('retains invalid-config, extraction-version %s and pending-reference gates in metadata', async extractionVersion => {
     await indexedFixture();
     const { DatabaseSync } = require('node:sqlite');
     const db = new DatabaseSync(path.join(root, '.codegraph/codegraph.db'));
     try {
-      db.prepare("UPDATE project_metadata SET value = '0' WHERE key = 'indexed_with_extraction_version'").run();
+      db.prepare("UPDATE project_metadata SET value = ? WHERE key = 'indexed_with_extraction_version'").run(extractionVersion);
       db.prepare("INSERT INTO unresolved_refs(from_node_id, reference_name, reference_kind, line, col) SELECT id, 'PendingTarget', 'call', 1, 0 FROM nodes LIMIT 1").run();
     } finally { db.close(); }
     const observation = status(true);

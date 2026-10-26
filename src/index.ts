@@ -1596,6 +1596,9 @@ export class CodeGraph {
     if (this.getIndexState() !== 'complete') {
       throw new Error('Automatic sync is refused for an incomplete index; explicitly recover it or validate an independent candidate.');
     }
+    if (this.getIndexBuildInfo().extractionVersion !== EXTRACTION_VERSION) {
+      throw new Error('Automatic sync is refused for an incompatible extraction version; explicitly validate an independent candidate.');
+    }
     const present = this.db.getDb().prepare(
       'SELECT EXISTS(SELECT 1 FROM files) AS files, EXISTS(SELECT 1 FROM nodes) AS nodes'
     ).get() as { files: number; nodes: number };
@@ -1785,16 +1788,15 @@ export class CodeGraph {
   }
 
   /**
-   * True when the on-disk index was built by an engine whose extraction is
-   * older than the one now running — i.e. a re-index would add data a migration
-   * can't backfill. False when there's no index yet (nothing to refresh) or the
-   * stamp is current. This is the signal behind `codegraph status`'s re-index
-   * hint and `codegraph upgrade`'s reminder.
+   * True when an existing index has a missing or incompatible extraction
+   * version. Older versions need a separately validated candidate; newer
+   * versions must not be maintained by an older engine. False when there is
+   * no index yet or the stamp is current. Used by the CLI status safety gate.
    */
   isIndexStale(): boolean {
     if (this.queries.getLastIndexedAt() == null) return false;
     const { extractionVersion } = this.getIndexBuildInfo();
-    return extractionVersion == null || extractionVersion < EXTRACTION_VERSION;
+    return extractionVersion !== EXTRACTION_VERSION;
   }
 
   /**
