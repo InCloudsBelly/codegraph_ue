@@ -19,13 +19,22 @@
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
+When a project opts into the UE engine source profile, only its configured
+engine scope is indexed. Queries first attempt an incremental update; if the
+scope cannot be verified, read the source directly. Include candidates and
+conditions are static observations, not confirmed build relationships; check
+source when following them. Plugins outside the applied depth may be absent.
+Ordinary preflight does not expand an unchanged scope. On an explicit request
+to update and advance UE plugin dependencies, use the documented
+\`codegraph sync --expand-ue-plugins\` command; do not rebuild an existing index.
+
 Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
 the workspace — pre-computed structure you would otherwise re-derive by
 reading files (cached intelligence: thousands of parse/trace decisions you
 don't pay to re-reason each run). It indexes 30+ languages
 (TypeScript/JavaScript, Python, Go, Rust, Java, C#, C/C++, PHP, Ruby, Swift,
-Kotlin, and more) — don't assume a language here isn't covered. Reads are
-sub-millisecond; the index lags writes by ~1s through the file watcher. Reach for it BEFORE *and* while
+Kotlin, and more), subject to the active project's scope. Where a watcher is
+enabled, it incrementally tracks changes. Reach for it BEFORE *and* while
 writing or editing code — not just for questions: one call returns the
 verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and

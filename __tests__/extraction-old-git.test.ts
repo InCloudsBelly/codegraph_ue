@@ -60,6 +60,26 @@ describe('Old git without `ls-files -s --recurse-submodules` support (#1549)', (
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('does not retry a timed-out staged Git command', async () => {
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    runGit(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'a.ts'), 'export const a = 1;');
+    const actual = await vi.importActual<typeof import('child_process')>('child_process');
+    let retried = 0;
+    vi.mocked(execFileSync).mockImplementation(((file, args, options) => {
+      if (file === 'git' && Array.isArray(args) && args[0] === 'ls-files' && args.includes('-s')) {
+        if (args.includes('--recurse-submodules')) {
+          throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT', signal: 'SIGTERM' });
+        }
+        retried++;
+      }
+      return actual.execFileSync(file, args, options);
+    }) as typeof execFileSync);
+    expect(() => scanDirectory(root)).toThrow();
+    expect(retried).toBe(0);
+  });
+
   it('still honours includeIgnored when `ls-files --recurse-submodules` is unsupported', async () => {
     const root = path.join(tempDir, 'root');
     makeRepo(root, 'a');

@@ -33,6 +33,9 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { CppIncludeEnvironment } from './cpp-include-environment';
+import type { CppIncludeQuote, CppIncludeResolution } from './cpp-include-environment';
+import { loadIndexingConfig } from '../indexing-config';
+import { maskUeTestOnlyCode } from '../extraction/ue-test-scope';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -311,6 +314,7 @@ export class ReferenceResolver {
   // Filesystem existence probes behind context.fileExists (paths not in knownFiles).
   private fileExistsMemo = new Map<string, boolean>();
   private cppIncludeEnvironment?: CppIncludeEnvironment;
+  private readonly ueStaticProfile: boolean;
   private fileLanguages?: Map<string, Language>;
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
@@ -338,6 +342,8 @@ export class ReferenceResolver {
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
     this.queries = queries;
+    try { this.ueStaticProfile = !!loadIndexingConfig(projectRoot).ueEngine; }
+    catch { this.ueStaticProfile = !!queries.getMetadata('ue_engine_scope_applied_v1'); }
 
     const limit = resolveCacheLimit();
     // The content cache is heavier (full file text), so we give it a
@@ -653,7 +659,9 @@ export class ReferenceResolver {
         this.fileCache.set(filePath, null);
         return null;
       }
-      const content = fs.readFileSync(fullPath, 'utf-8');
+      const source = fs.readFileSync(fullPath, 'utf-8');
+      const content = this.ueStaticProfile && /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|inl)$/i.test(filePath)
+        ? maskUeTestOnlyCode(source) : source;
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
@@ -669,6 +677,9 @@ export class ReferenceResolver {
    * unchanged, and decoding is most of reading a file nobody keeps.
    */
   private fileContains(filePath: string, needle: string): boolean {
+    if (this.ueStaticProfile && /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|inl)$/i.test(filePath)) {
+      return this.readFileCached(filePath)?.includes(needle) ?? false;
+    }
     if (this.fileCache.has(filePath)) return this.fileCache.get(filePath)?.includes(needle) ?? false;
     const fullPath = path.join(this.projectRoot, filePath);
     try {
@@ -731,6 +742,38 @@ export class ReferenceResolver {
     // and older pooled indexes never recorded their module observations.
     if (this.context.getAllFiles().some(file => /\.Build\.cs$/i.test(file))) this.cppIncludeEnvironment.getUeModuleRules();
     return this.cppIncludeEnvironment.snapshot(previous);
+  }
+
+  /** Static paths are candidates; preprocessing may redirect even a local include. */
+  private resolveUeStaticInclude(fromFile: string, spec: string, quote: CppIncludeQuote = 'unknown', line?: number): CppIncludeResolution {
+    const normalized = spec.replace(/\\/g, '/');
+    if (quote === 'unknown' && line !== undefined) {
+      const text = this.context.getFileLines?.(fromFile)?.[line - 1];
+      quote = text?.match(/^\s*#\s*include\s*(["<])/)?.[1] as CppIncludeQuote ?? 'unknown';
+    }
+    if (quote === 'unknown') {
+      const forms = new Set(this.context.getNodesInFile(fromFile)
+        .filter(node => node.kind === 'import' && node.name === spec)
+        .map(node => node.signature?.match(/^\s*#\s*include\s*(["<])/)?.[1]).filter(Boolean));
+      if (forms.size === 1) quote = [...forms][0] as CppIncludeQuote;
+    }
+    const basename = path.posix.basename(normalized);
+    const named = process.platform === 'win32' ? this.context.getNodesByLowerName(basename.toLowerCase()) : this.context.getNodesByName(basename);
+    const paths = named.filter(node => node.kind === 'file').map(node => node.filePath);
+    const compare = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value;
+    if (quote === '"') {
+      const sibling = path.posix.normalize(path.posix.join(path.posix.dirname(fromFile), normalized));
+      if (!sibling.startsWith('../') && !path.posix.isAbsolute(sibling)) {
+        const exact = paths.find(file => compare(file) === compare(sibling));
+        if (exact) return { status: 'ambiguous', reason: 'ue-static-quoted-local-candidate', candidates: [exact] };
+      }
+    }
+    const suffix = compare(normalized.replace(/^\.\//, ''));
+    const matches = [...new Set(paths.filter(file => compare(file) === suffix || compare(file).endsWith('/' + suffix)))].sort();
+    const candidates = matches.slice(0, 32);
+    if (matches.length > 32) candidates.push(`… ${matches.length - 32} more candidates; narrow the source scope`);
+    return candidates.length ? { status: 'ambiguous', reason: 'ue-static-candidates', candidates }
+      : { status: 'not-in-scope', reason: 'ue-static-no-indexed-candidate', candidates: [] };
   }
 
   private createContext(): ResolutionContext {
@@ -1118,6 +1161,7 @@ export class ReferenceResolver {
         return this.cppIncludeEnvironment.getUeModuleRules();
       },
       resolveCppInclude: (file, spec, quote, line) => {
+        if (this.ueStaticProfile) return this.resolveUeStaticInclude(file, spec, quote, line);
         this.cppIncludeEnvironment ??= new CppIncludeEnvironment(this.context);
         return this.cppIncludeEnvironment.resolve(file, spec, quote, line);
       },
@@ -1148,6 +1192,7 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      candidates: ref.candidates,
       rowId: ref.rowId,
     }));
 
@@ -1404,6 +1449,7 @@ export class ReferenceResolver {
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
     if (isVisibleCppMacro(ref, this.context)) return null;
+    if (this.ueStaticProfile && this.retainAmbiguousUeTargets(ref)) return null;
     // A Swift type reference never lands on an `extension X {}` node, nor on a
     // nested type it cannot name bare (see ./swift-type-visibility).
     // A name a declaration around the reference declares as a type parameter
@@ -1461,7 +1507,70 @@ export class ReferenceResolver {
     }, ref);
   }
 
+  /** Do not choose an arbitrary same-named C++ call or supertype target. */
+  private retainAmbiguousUeTargets(ref: UnresolvedRef): boolean {
+    if ((ref.language !== 'c' && ref.language !== 'cpp') ||
+        !['calls', 'extends', 'implements'].includes(ref.referenceKind)) return false;
+    const original = ref.referenceName.replace(/\/\d+$/, '');
+    const name = original.split(/::|->|\./).pop() ?? '';
+    if (!/^[A-Za-z_]\w*$/.test(name)) return false;
+    const isCall = ref.referenceKind === 'calls';
+    let candidates = this.context.getNodesByName(name).filter(node =>
+      (node.language === 'c' || node.language === 'cpp') && (isCall
+        ? node.kind === 'function' || node.kind === 'method'
+        : node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface'));
+    if (original.includes('::')) {
+      candidates = candidates.filter(node => node.qualifiedName === original || node.qualifiedName.endsWith(`::${original}`));
+    }
+    if (candidates.length > 1) {
+      // A unique declaration in the caller's enclosing lexical scope is not
+      // ambiguous merely because another namespace uses the same name.
+      if (/^[A-Za-z_]\w*$/.test(original) || /^this(?:->|\.)[A-Za-z_]\w*$/.test(original)) {
+        const caller = this.nodeById(ref.fromNodeId);
+        const scope = caller?.qualifiedName.split('::') ?? [];
+        scope.pop();
+        while (scope.length) {
+          const qualified = `${scope.join('::')}::${name}`;
+          const local = candidates.filter(node => node.qualifiedName === qualified);
+          if (local.length === 1 && local[0]!.filePath === ref.filePath) return false;
+          if (local.length) break;
+          scope.pop();
+        }
+      }
+      const ordered = candidates.map(node => `${node.filePath}:${node.startLine} ${node.qualifiedName}`).sort();
+      ref.candidates = ordered.slice(0, 32);
+      if (ordered.length > 32) ref.candidates.push(`… ${ordered.length - 32} more candidates; narrow the source scope`);
+      return true;
+    }
+    if (ref.candidates !== undefined) ref.candidates = [];
+    return false;
+  }
+
+  /** Names whose new definitions require rechecking existing UE relations. */
+  getAmbiguousUeTargetNames(names: readonly string[]): string[] {
+    if (!this.ueStaticProfile) return [];
+    return [...new Set(names)].filter(name => {
+      let calls = 0, types = 0;
+      for (const node of this.context.getNodesByName(name)) {
+        if (node.language !== 'c' && node.language !== 'cpp') continue;
+        if (node.kind === 'function' || node.kind === 'method') calls++;
+        else if (node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface') types++;
+        if (calls > 1 || types > 1) return true;
+      }
+      return false;
+    });
+  }
+
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    if (this.ueStaticProfile && (ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+      const observed = this.resolveUeStaticInclude(ref.filePath, ref.referenceName, 'unknown', ref.line);
+      if (observed.status !== 'resolved') ref.candidates = observed.candidates ?? [];
+      return resolveViaImport(ref, this.context);
+    }
+    if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+      const line = this.context.getFileLines?.(ref.filePath)?.[ref.line - 1];
+      if (line && /^\s*#\s*include\s+[A-Za-z_]/.test(line)) return null;
+    }
     if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports' &&
       this.context.resolveCppInclude?.(ref.filePath, ref.referenceName, 'unknown', ref.line).status !== 'no-environment') {
       return resolveViaImport(ref, this.context);
@@ -1924,6 +2033,27 @@ export class ReferenceResolver {
     return { byRowId, legacyKeys };
   }
 
+  private persistUeIncludeCandidates(unresolved: readonly UnresolvedRef[]): void {
+    if (!this.ueStaticProfile) return;
+    this.queries.updateUeCandidates(unresolved.filter(ref =>
+      ref.rowId != null && ref.candidates !== undefined && ['imports', 'calls', 'extends', 'implements'].includes(ref.referenceKind) &&
+      (ref.language === 'c' || ref.language === 'cpp'))
+      .map(ref => ({ rowId: ref.rowId!, candidates: ref.candidates! })));
+  }
+
+  /** Re-evaluate retained candidates after indexed headers are added or removed. */
+  async refreshUeIncludeCandidates(): Promise<void> {
+    if (!this.ueStaticProfile) return;
+    let after = 0;
+    for (;;) {
+      const batch = this.queries.getUeCandidateReferencesAfter(after, 1000);
+      if (!batch.length) return;
+      after = batch[batch.length - 1]!.rowId!;
+      await this.resolveAndPersistListYielding(batch);
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  }
+
   /**
    * `ref`, which no strategy resolved, with the tail it is parked under when
    * that is not the one its name gives: a reference through an import
@@ -1990,6 +2120,7 @@ export class ReferenceResolver {
     // is still 'pending', so any pending row at rest belongs to an
     // interrupted run and the sweep can key off the pending count.
     if (result.unresolved.length > 0) {
+      this.persistUeIncludeCandidates(result.unresolved);
       const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
       this.queries.markReferencesFailedByRowIds(byRowId);
       this.queries.markReferencesFailed(legacyKeys);
@@ -2038,6 +2169,7 @@ export class ReferenceResolver {
       await maybeYield();
     }
 
+    this.persistUeIncludeCandidates(result.unresolved);
     const failedCleanup = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
     for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
       this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
@@ -2164,6 +2296,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -2284,6 +2417,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -2692,6 +2826,7 @@ export class ReferenceResolver {
       // symbol that could satisfy them (#1240).
       tLp = Date.now();
       const failures = this.nonDeferredFailures(result.unresolved);
+      this.persistUeIncludeCandidates(failures);
       const deferredCount = result.unresolved.length - failures.length;
       const failedCleanup = ReferenceResolver.partitionFailedCleanup(failures);
       for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {

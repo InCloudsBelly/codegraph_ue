@@ -406,6 +406,7 @@ export class MCPEngine {
    */
   private startWatching(): void {
     if (this.opts.readOnly || !this.cg || this.watcherStarted || !this.opts.watch) return;
+    if (this.cg.hasUeScopeProfile?.()) return;
 
     const opened = this.cg;
     opened.assertAutomaticSyncAllowed();
@@ -429,6 +430,7 @@ export class MCPEngine {
   private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
+    if (cg.hasUeScopeProfile?.()) return;
     // The lease's gate is the startup reconcile and stays settled once caught
     // up; a database reopened after a rebuild (#1902) needs a sync of its own.
     if (this.defaultLease && !afterReopen) {

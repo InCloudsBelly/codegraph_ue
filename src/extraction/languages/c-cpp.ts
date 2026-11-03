@@ -2,6 +2,13 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** Preserve macro-based include expressions as written, without resolving them. */
+function macroInclude(importText: string): { moduleName: string; signature: string } | null {
+  const expression = importText.match(/^\s*#\s*include\s+([^\r\n]+)/)?.[1]?.replace(/\/\/.*$/, '').trim();
+  if (!expression || !/^[A-Za-z_]\w*/.test(expression)) return null;
+  return { moduleName: expression, signature: importText };
+}
+
 /**
  * Resolve the declared identifier inside a C declarator. A `declaration`'s
  * `declarator` field nests the name through `init_declarator` (with value),
@@ -484,7 +491,7 @@ export const cExtractor: LanguageExtractor = {
         return { moduleName: getNodeText(stringContent, source), signature: importText };
       }
     }
-    return null;
+    return macroInclude(importText);
   },
 };
 
@@ -2705,6 +2712,6 @@ export const cppExtractor: LanguageExtractor = {
         return { moduleName: getNodeText(stringContent, source), signature: importText };
       }
     }
-    return null;
+    return macroInclude(importText);
   },
 };

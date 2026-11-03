@@ -64,6 +64,7 @@ import {
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges, measureCppIncludeEnvironment } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
+import { ueConditionsAtLine } from '../extraction/ue-conditions';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -2681,9 +2682,72 @@ export class ToolHandler {
     return result;
   }
 
-  private async withCppIncludeNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
+  private async withCppIncludeNotice(result: ToolResult, projectPath?: string, answerFiles?: readonly { path: string }[]): Promise<ToolResult> {
     let cg: CodeGraph;
     try { cg = this.getCodeGraph(projectPath); } catch { return result; }
+    if (cg.hasUeScopeProfile?.()) {
+      const [head, ...tail] = result.content;
+      if (!head || head.type !== 'text') return result;
+      if (!answerFiles?.length) {
+        return { ...result, content: [{ type: 'text', text: `> UE static relationships may include unresolved source references; check scope status and the relevant source.\n\n${head.text}` }, ...tail] };
+      }
+      const notes: string[] = [];
+      for (const { path: file } of answerFiles) {
+        const refs = cg.getUnresolvedReferencesInFile(file, 5000);
+        let imports: Node[] | undefined;
+        let source: string | undefined;
+        const loadVerifiedSource = (): string | undefined => {
+          if (source !== undefined) return source;
+          try {
+            const record = cg.getFile(file);
+            const absolute = validatePathWithinRoot(cg.getProjectRoot(), file);
+            if (!record || !absolute || statSync(absolute).size > 1024 * 1024) return undefined;
+            const text = readFileSync(absolute, 'utf8');
+            if (createHash('sha256').update(text).digest('hex') !== record.contentHash) return undefined;
+            source = text;
+            return source;
+          } catch { return undefined; }
+        };
+        const conditionAt = (line: number): string => {
+          const text = loadVerifiedSource();
+          if (text === undefined) return ' [condition unavailable; inspect source]';
+          const conditions = ueConditionsAtLine(text, line);
+          return conditions.length ? ` [condition: ${conditions.join(' && ')}]` : '';
+        };
+        for (const ref of refs) {
+          if (ref.candidates?.length) {
+            const displayed = ref.candidates.slice(0, 5).join(', ');
+            const remaining = ref.candidates.length > 5 ? ` (+${ref.candidates.length - 5} more recorded)` : '';
+            notes.push(`- ${file}:${ref.line} — ${ref.referenceKind} ${ref.referenceName}: ${displayed}${remaining} (candidates)${conditionAt(ref.line)}`);
+          }
+          else if (ref.referenceKind === 'imports') {
+            imports ??= cg.getNodesInFile(file).filter(node => node.kind === 'import');
+            const site = imports.find(node => node.startLine === ref.line && node.name === ref.referenceName);
+            if (site?.signature && /^\s*#\s*include\s+[A-Za-z_]/.test(site.signature)) notes.push(`- ${file}:${ref.line} — ${site.signature} (preprocessor expression)${conditionAt(ref.line)}`);
+          }
+          if (notes.length >= 8) break;
+        }
+        if (notes.length < 8) {
+          for (const node of cg.getNodesInFile(file)) {
+            if (node.kind === 'file' || node.kind === 'import' || node.name.length < 3 || !head.text.includes(node.name)) continue;
+            const condition = conditionAt(node.startLine);
+            if (condition) notes.push(`- ${file}:${node.startLine} — ${node.qualifiedName}${condition}`);
+            if (notes.length >= 8) break;
+          }
+        }
+        if (refs.length >= 5000) notes.push(`- ${file}: more references may be omitted; inspect the source.`);
+        if (notes.length >= 8) break;
+      }
+      const modules = cg.getUeModuleRelations(answerFiles.map(answer => answer.path));
+      const moduleLines = modules.relations.slice(0, 5).map(link => `- ${link.from} → ${link.to} (inferred from C/C++ source)`);
+      if (modules.truncated || modules.relations.length > 5) moduleLines.push('- Additional module associations may be omitted; narrow the query.');
+      if (!notes.length && !moduleLines.length) return result;
+      const details = [
+        ...(notes.length ? ['> UE source conditions and candidates are static observations; verify them in source.', ...notes] : []),
+        ...(moduleLines.length ? ['**UE module associations:**', ...moduleLines] : []),
+      ].join('\n');
+      return { ...result, content: [{ type: 'text', text: `${details}\n\n${head.text}` }, ...tail] };
+    }
     if (!cg.hasCppIncludeFiles?.()) return result;
     const state = await measureCppIncludeEnvironment(cg.getProjectRoot());
     if (state?.observed && state.complete && !state.changed && state.inputsVerified !== false) return result;
@@ -2850,6 +2914,19 @@ export class ToolHandler {
       }
 
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // UE source profiles reconcile at the point of use, not in a persistent
+      // watcher. A failed or unverifiable reconcile must not serve stale rows.
+      if (project.hasUeScopeProfile?.() && toolName !== 'codegraph_status') {
+        try {
+          await project.syncAutomatically();
+          const scope = await project.getUeScopeStatus();
+          if (!scope || scope.state !== 'fresh') {
+            return this.textResult(`CodeGraph cannot verify a fresh UE scope (${scope?.reason ?? 'unknown'}). Read the source directly and retry after a successful sync.`);
+          }
+        } catch (error) {
+          return this.textResult(`CodeGraph cannot update the UE scope: ${error instanceof Error ? error.message : String(error)}. Read the source directly and retry after a successful sync.`);
+        }
+      }
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).
@@ -2898,7 +2975,7 @@ export class ToolHandler {
         : await this.executeReadTool(toolName, dispatchArgs);
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
-      if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {
+      if (!raw.isError && answeredFrom && (project.hasUeScopeProfile?.() || wasDegraded || project.isWatcherDegraded?.())) {
         const validation = await validateAnswerFiles(project.getProjectRoot(), answeredFrom);
         if (validation.stale.length || validation.unchecked.length) {
           // Rejected source must not enter the session's emission history.
@@ -2924,7 +3001,7 @@ export class ToolHandler {
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withCppIncludeNotice(this.withStalenessNotice(withWorktree, args.projectPath as string | undefined), args.projectPath as string | undefined);
+      return this.withCppIncludeNotice(this.withStalenessNotice(withWorktree, args.projectPath as string | undefined), args.projectPath as string | undefined, answeredFrom);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
@@ -8168,8 +8245,14 @@ export class ToolHandler {
     // filesystem fallback can stall on a large/busy checkout, but status must
     // not block the shared daemon's transport (#1959). Unknown is never zero.
     const lastIndexedAt = cg.getLastIndexedAt();
-    const changes = await measurePendingChanges(cg.getProjectRoot());
-    if (cg.hasCppIncludeFiles?.()) {
+    const ueScope = cg.hasUeScopeProfile?.() ? await cg.getUeScopeStatus() : null;
+    const changes = ueScope
+      ? ueScope.state === 'fresh' ? { added: 0, modified: 0, removed: 0 } : null
+      : await measurePendingChanges(cg.getProjectRoot());
+    if (ueScope) {
+      lines.push(`**UE scope:** ${ueScope.state}; plugin depth ${ueScope.depth ?? '?'} / ${ueScope.maxDepth ?? '?'}; ${ueScope.plugins.length} plugins; ${ueScope.unresolvedCount} candidate sites; ${ueScope.outsidePluginCandidates} sites reference unselected plugin candidates; ${ueScope.incompleteFiles.length} incompletely observed files.`);
+      lines.push('**UE relationship coverage:** inferred from static source; ambiguous targets remain candidates and deeper plugin dependencies may be unexpanded.');
+    } else if (cg.hasCppIncludeFiles?.()) {
       const environment = await measureCppIncludeEnvironment(cg.getProjectRoot());
       const inputsVerified = environment?.observed && environment.inputsVerified === true && !environment.changed;
       lines.push(`**C/C++ include environment:** ${inputsVerified && !environment.complete

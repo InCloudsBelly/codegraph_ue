@@ -3013,6 +3013,53 @@ export class QueryBuilder {
     }));
   }
 
+  /** Persist static candidates separately from trusted graph edges. */
+  updateUeCandidates(refs: readonly { rowId: number; candidates: string[] }[]): void {
+    if (!refs.length) return;
+    const stmt = this.db.prepare("UPDATE unresolved_refs SET candidates = ? WHERE id = ? AND reference_kind IN ('imports', 'calls', 'extends', 'implements') AND language IN ('c', 'cpp')");
+    this.runInTransaction(() => {
+      for (const ref of refs) stmt.run(JSON.stringify(ref.candidates), ref.rowId);
+    });
+  }
+
+  mergeUePluginCandidates(refs: readonly { file: string; line: number; include: string; candidates: string[] }[]): void {
+    if (!refs.length) return;
+    const pathMatch = process.platform === 'win32' ? 'file_path = ? COLLATE NOCASE' : 'file_path = ?';
+    const select = this.db.prepare(`SELECT id, candidates FROM unresolved_refs WHERE ${pathMatch} AND line = ? AND reference_name = ? AND reference_kind = 'imports' AND language IN ('c', 'cpp')`);
+    const update = this.db.prepare('UPDATE unresolved_refs SET candidates = ? WHERE id = ?');
+    this.runInTransaction(() => {
+      for (const ref of refs) {
+        const rows = select.all(ref.file, ref.line, ref.include) as Array<{ id: number; candidates: string | null }>;
+        for (const row of rows) {
+          const parsed: unknown = row.candidates ? safeJsonParse(row.candidates, []) : [];
+          const existing = Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [];
+          const combined = [...new Set([...existing, ...ref.candidates])];
+          const paths = combined.filter(candidate => !candidate.startsWith('… ')).sort();
+          const truncated = paths.length > 32 || combined.some(candidate => candidate.startsWith('… '));
+          const candidates = paths.slice(0, 32);
+          if (truncated) candidates.push('… additional candidates omitted; narrow the source scope');
+          update.run(JSON.stringify(candidates), row.id);
+        }
+      }
+    });
+  }
+
+  getUeCandidateReferencesAfter(after: number, limit: number): UnresolvedReference[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM unresolved_refs WHERE id > ? AND language IN ('c', 'cpp') AND (reference_kind = 'imports' OR (reference_kind IN ('calls', 'extends', 'implements') AND candidates IS NOT NULL)) ORDER BY id LIMIT ?"
+    ).all(after, limit) as UnresolvedRefRow[];
+    return rows.map(row => ({
+      fromNodeId: row.from_node_id, referenceName: row.reference_name, referenceKind: row.reference_kind as EdgeKind,
+      line: row.line, column: row.col, candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path, language: row.language as Language, rowId: row.id,
+    }));
+  }
+
+  getUeCandidateCount(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM unresolved_refs WHERE reference_kind IN ('imports', 'calls', 'extends', 'implements') AND language IN ('c', 'cpp') AND candidates IS NOT NULL AND candidates <> '[]'").get() as { count: number };
+    return row.count;
+  }
+
   /**
    * References recorded against a symbol that never resolved to a node — the
    * calls and type mentions that leave the index (a third-party package, a
@@ -4584,6 +4631,36 @@ export class QueryBuilder {
       }
     }
     return out;
+  }
+
+  /** Recovery can follow a crash before the definition delta was recorded. */
+  getAllAmbiguousUeTargetNames(): string[] {
+    const rows = this.db.prepare(
+      `SELECT name FROM nodes
+        WHERE language IN ('c', 'cpp') AND kind IN ('function', 'method', 'class', 'struct', 'interface')
+        GROUP BY name
+        HAVING SUM(CASE WHEN kind IN ('function', 'method') THEN 1 ELSE 0 END) > 1
+            OR SUM(CASE WHEN kind IN ('class', 'struct', 'interface') THEN 1 ELSE 0 END) > 1`
+    ).all() as Array<{ name: string }>;
+    return rows.map(row => row.name);
+  }
+
+  /** Bounded keyset reader: UE ambiguity must not inherit the per-name ceiling. */
+  getUeResolutionEdgesByTargetNameAfter(names: readonly string[], after: number, limit: number): Array<Edge & {
+    edgeId: number; sourceFilePath: string; sourceLanguage: Language;
+  }> {
+    if (!names.length) return [];
+    // Walk the rowid range in order; the kind index would sort the remaining
+    // edges again for every page of this keyset traversal.
+    const rows = this.db.prepare(
+      `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+         FROM edges e NOT INDEXED JOIN nodes src ON src.id = e.source JOIN nodes tgt ON tgt.id = e.target
+        WHERE e.id > ? AND tgt.name IN (SELECT value FROM json_each(?))
+          AND src.language IN ('c', 'cpp') AND e.kind IN ('calls', 'extends', 'implements', 'instantiates')
+          AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+        ORDER BY e.id LIMIT ?`
+    ).all(after, JSON.stringify(names), limit) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map(row => ({ ...rowToEdge(row), edgeId: row.id, sourceFilePath: row.source_file_path, sourceLanguage: row.source_language }));
   }
 
   /**

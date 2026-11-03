@@ -997,7 +997,8 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('--expand-ue-plugins', 'Explicitly advance one UE plugin dependency layer')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; expandUePlugins?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -1013,7 +1014,7 @@ program
 
       try {
         if (options.quiet) {
-          await cg.sync();
+          await cg.sync({ expandUePlugins: options.expandUePlugins });
           return;
         }
 
@@ -1025,6 +1026,7 @@ program
 
         const result = await cg.sync({
           onProgress: progress.onProgress,
+          expandUePlugins: options.expandUePlugins,
         }).finally(() => progress.stop());
 
         const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
@@ -1126,21 +1128,27 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath, options.metadataOnly ? { readOnly: true, sync: false } : {});
       const stats = cg.getStats();
+      const ueScope = options.metadataOnly || indexingConfig.error ? null : await cg.getUeScopeStatus();
       // Invalid scope configuration must remain diagnosable without scanning it.
-      const changes = options.metadataOnly || indexingConfig.error ? null : cg.getChangedFiles();
+      const changes = options.metadataOnly || indexingConfig.error ? null : ueScope
+        ? ueScope.state === 'fresh' ? { added: [], modified: [], removed: [] } : null
+        : cg.getChangedFiles();
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
-      const indexState = cg.getIndexState();
+      const storedIndexState = cg.getIndexState();
+      // Existing consumers understand partial; never let an old adapter call
+      // a stale/unknown UE generation fresh because it ignores ueScope.
+      const indexState = ueScope && ueScope.state !== 'fresh' && storedIndexState === 'complete' ? 'partial' : storedIndexState;
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
       const pendingRefs = cg.getPendingReferenceCount();
       // Files whose content is current but whose symbols are missing — the
       // content-hash check behind "up to date" cannot see them (#2336).
       const health = options.metadataOnly ? null : cg.getIndexHealth();
-      const cppEnvironmentStatus = options.metadataOnly ? null : cg.getCppIncludeEnvironmentStatus();
+      const cppEnvironmentStatus = options.metadataOnly || ueScope ? null : cg.getCppIncludeEnvironmentStatus();
       const cppIncludeEnvironment = cppEnvironmentStatus ? {
         observed: cppEnvironmentStatus.observed,
         complete: cppEnvironmentStatus.complete,
@@ -1159,8 +1167,12 @@ program
           projectPath,
           indexPath: getCodeGraphDir(projectPath),
           indexingConfig,
+          ...(ueScope ? { ueScope } : {}),
           ...(options.metadataOnly ? { workingTreeChecked: false, freshness: 'unknown' } : {}),
-          cppIncludeEnvironment,
+          // The UE profile reports its static scope instead of claiming to have
+          // checked a compiler include environment. Older consumers already
+          // treat this optional field as absent and honor index.state.
+          ...(ueScope ? {} : { cppIncludeEnvironment }),
           lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
@@ -1205,6 +1217,10 @@ program
       }
 
       console.log(chalk.bold('\nCodeGraph Status\n'));
+
+      if (ueScope) {
+        console.log(chalk.cyan('UE scope:'), `${ueScope.state}; depth ${ueScope.depth ?? '?'} / ${ueScope.maxDepth ?? '?'}; ${ueScope.plugins.length} plugins; ${ueScope.unresolvedCount} candidate sites; ${ueScope.incompleteFiles.length} incomplete files`);
+      }
 
       // Project info
       console.log(chalk.cyan('Project:'), projectPath);

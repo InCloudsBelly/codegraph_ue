@@ -7,7 +7,7 @@ import { readUeModuleRules, readUePluginDescriptor, type UeModuleRules, type UeM
 export type CppIncludeQuote = '"' | '<' | 'unknown';
 export type CppIncludeResolution =
   | { status: 'resolved'; file: string; environment: string }
-  | { status: 'no-environment' | 'not-in-scope' | 'ambiguous' | 'incomplete'; reason?: string };
+  | { status: 'no-environment' | 'not-in-scope' | 'ambiguous' | 'incomplete'; reason?: string; candidates?: string[] };
 
 interface Environment {
   id: string;

@@ -1,0 +1,16 @@
+{
+  "exclude": [
+    "Engine/Source/Programs/ReplicationSystemTest/"
+  ],
+  "ueEngine": {
+    "plugins": [
+      "Engine/Plugins/Kuaishou/KGEngineCore",
+      "Engine/Plugins/SceneConvertor"
+    ],
+    "excludePlugins": [
+      "Engine/Plugins/Runtime/ReplicationSystemTestPlugin"
+    ],
+    "extraRoots": [],
+    "maxDepth": 3
+  }
+}

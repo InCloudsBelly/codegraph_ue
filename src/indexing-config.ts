@@ -6,12 +6,21 @@ import { normalizePath } from './utils';
 
 export const INDEXING_CONFIG_FILE = 'indexing.json';
 
+/** Opt-in policy for one UE engine source index, never a global language default. */
+export interface UeEngineConfig {
+  plugins: string[];
+  excludePlugins: string[];
+  extraRoots: string[];
+  maxDepth: number;
+}
+
 export interface IndexingConfig {
   path: string;
   loaded: boolean;
   include: string[];
   exclude: string[];
   includeRoots: string[];
+  ueEngine?: UeEngineConfig;
 }
 
 export interface IndexingConfigStatus {
@@ -20,6 +29,7 @@ export interface IndexingConfigStatus {
   include: string[];
   exclude: string[];
   error: string | null;
+  ueEngine?: UeEngineConfig;
 }
 
 export function getIndexingConfigPath(projectRoot: string): string {
@@ -62,6 +72,46 @@ function includeRootFor(pattern: string): string {
   return firstGlobSegment >= 0 ? segments.slice(0, firstGlobSegment).join('/') : pattern.replace(/\/+$/, '');
 }
 
+function concreteRelativePath(configPath: string, field: string, value: unknown, index: number): string {
+  if (typeof value !== 'string' || !value.trim() || value !== value.trim()) fail(configPath, `${field}[${index}] must be a non-empty path or name`);
+  if (value.includes('\\') || path.isAbsolute(value) || path.win32.isAbsolute(value) || /[\0*?{}()[\]!]/.test(value)) {
+    fail(configPath, `${field}[${index}] must be a concrete project-relative POSIX path or name`);
+  }
+  const normalized = normalizePath(value).replace(/\/+$/, '');
+  if (!normalized || normalized.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
+    fail(configPath, `${field}[${index}] must not contain empty, "." or ".." path segments`);
+  }
+  return normalized;
+}
+
+function ueEngineConfig(configPath: string, raw: unknown): UeEngineConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail(configPath, 'ueEngine must be an object');
+  const value = raw as Record<string, unknown>;
+  const allowed = new Set(['plugins', 'excludePlugins', 'extraRoots', 'maxDepth']);
+  for (const key of Object.keys(value)) if (!allowed.has(key)) fail(configPath, `Unknown ueEngine key "${key}"`);
+  const list = (field: 'plugins' | 'excludePlugins' | 'extraRoots'): string[] => {
+    const entries = value[field];
+    if (entries === undefined) return [];
+    if (!Array.isArray(entries)) fail(configPath, `ueEngine.${field} must be an array`);
+    return [...new Set(entries.map((entry, index) => concreteRelativePath(configPath, `ueEngine.${field}`, entry, index)))];
+  };
+  const plugins = list('plugins');
+  const excludePlugins = list('excludePlugins');
+  const extraRoots = list('extraRoots');
+  for (const root of extraRoots) {
+    if (!/^(?:Engine|Samples|Templates)\/[^/]+/i.test(root)) fail(configPath, 'ueEngine.extraRoots must name a concrete path inside Engine/, Samples/, or Templates/');
+    if (/^Engine\/Plugins(?:\/|$)/i.test(root) || /^Engine\/Platforms(?:\/[^/]+)?(?:\/Plugins(?:\/|$)|$)/i.test(root)) {
+      fail(configPath, 'ueEngine.extraRoots must not bypass plugin selection; use ueEngine.plugins instead');
+    }
+  }
+  const maxDepth = value.maxDepth === undefined ? 3 : value.maxDepth;
+  if (typeof maxDepth !== 'number' || !Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > 16) {
+    fail(configPath, 'ueEngine.maxDepth must be an integer from 0 to 16');
+  }
+  return { plugins, excludePlugins, extraRoots, maxDepth };
+}
+
 /** Local scope is deliberately strict: a typo must not silently index a different tree. */
 export function loadIndexingConfig(projectRoot: string): IndexingConfig {
   const configPath = getIndexingConfigPath(projectRoot);
@@ -77,17 +127,18 @@ export function loadIndexingConfig(projectRoot: string): IndexingConfig {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) fail(configPath, 'top-level value must be an object');
   const raw = parsed as Record<string, unknown>;
   for (const key of Object.keys(raw)) {
-    if (key !== 'include' && key !== 'exclude') fail(configPath, `Unknown indexing config key "${key}"; expected include or exclude`);
+    if (key !== 'include' && key !== 'exclude' && key !== 'ueEngine') fail(configPath, `Unknown indexing config key "${key}"; expected include, exclude or ueEngine`);
   }
   const include = validatePatternArray(configPath, raw, 'include');
   const exclude = validatePatternArray(configPath, raw, 'exclude');
-  return { path: configPath, loaded: true, include, exclude, includeRoots: [...new Set(include.map(includeRootFor).filter(Boolean))] };
+  const ueEngine = ueEngineConfig(configPath, raw.ueEngine);
+  return { path: configPath, loaded: true, include, exclude, includeRoots: [...new Set(include.map(includeRootFor).filter(Boolean))], ...(ueEngine ? { ueEngine } : {}) };
 }
 
 export function getIndexingConfigStatus(projectRoot: string): IndexingConfigStatus {
   try {
     const config = loadIndexingConfig(projectRoot);
-    return { path: config.path, loaded: config.loaded, include: config.include, exclude: config.exclude, error: null };
+    return { path: config.path, loaded: config.loaded, include: config.include, exclude: config.exclude, error: null, ...(config.ueEngine ? { ueEngine: config.ueEngine } : {}) };
   } catch (error) {
     return { path: getIndexingConfigPath(projectRoot), loaded: false, include: [], exclude: [], error: error instanceof Error ? error.message : String(error) };
   }

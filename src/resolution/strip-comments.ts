@@ -66,6 +66,9 @@ export function blankStringContents(text: string, regexLiterals?: number[]): str
       while (i < n && text[i] !== quote) {
         if (text[i] === '\\' && i + 1 < n) {
           out[i] = ' ';
+          // Escaped physical newlines must retain line and column alignment.
+          if (text[i + 1] === '\n') { i += 2; continue; }
+          if (text[i + 1] === '\r' && text[i + 2] === '\n') { i += 3; continue; }
           out[i + 1] = ' ';
           i += 2;
           continue;
@@ -118,7 +121,7 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
     case 'swift':
     case 'c':
     case 'cpp':
-      return stripCStyle(content, /* allowSingleQuoteStrings */ lang === 'javascript' || lang === 'typescript');
+      return stripCStyle(content, /* allowSingleQuoteStrings */ lang === 'javascript' || lang === 'typescript', /* spliceLineComments */ lang === 'c' || lang === 'cpp');
     default:
       return content;
   }
@@ -276,7 +279,7 @@ function stripRuby(src: string): string {
 
 // ---------- C-style (JS/TS/Java/C#/Swift) ----------
 
-function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
+function stripCStyle(src: string, allowSingleQuoteStrings: boolean, spliceLineComments = false): string {
   const out = src.split('');
   let i = 0;
   const n = src.length;
@@ -295,10 +298,14 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
       continue;
     }
 
-    // Line comment
+    // C/C++ remove escaped newlines before recognizing line-comment ends.
     if (c === '/' && c2 === '/') {
       const start = i;
-      while (i < n && src[i] !== '\n') i++;
+      while (i < n && src[i] !== '\n') {
+        if (spliceLineComments && src[i] === '\\' && src[i + 1] === '\n') { i += 2; continue; }
+        if (spliceLineComments && src[i] === '\\' && src[i + 1] === '\r' && src[i + 2] === '\n') { i += 3; continue; }
+        i++;
+      }
       blankRange(out, start, i, src);
       continue;
     }

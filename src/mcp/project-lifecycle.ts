@@ -145,6 +145,12 @@ async function activate(root: string, project: Project): Promise<void> {
     return;
   }
   project.owner = true;
+  if (project.cg.hasUeScopeProfile?.()) {
+    // UE profiles synchronize when a query is made, not through a watcher.
+    project.caughtUp = true;
+    markWriterReady(root);
+    return;
+  }
   const disabled = watchDisabledReason(root);
   if (disabled) {
     process.stderr.write(`[CodeGraph MCP] File watcher disabled for ${root} — ${disabled}.\n`);
