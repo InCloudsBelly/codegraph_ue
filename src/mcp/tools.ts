@@ -4255,6 +4255,7 @@ export class ToolHandler {
       return ` Not pinned: ${which}, which define${s.files.length === 1 ? 's' : ''} none of the named symbols.`;
     }).join('');
     const pinnedSet = new Set(pinnedFiles);
+    const ueFileOnlyPins = new Set<string>();
     const pinnedOrder = new Map(pinnedFiles.map((p, i) => [p, i]));
 
     // Per-file allocation diagnostic (CG-4). `null` unless CODEGRAPH_EXPLORE_DEBUG
@@ -4339,11 +4340,20 @@ export class ToolHandler {
     for (const fp of pinnedFiles) {
       let fileNodes: Node[] = [];
       try { fileNodes = cg.getNodesInFile(fp); } catch { continue; }
-      fileNodes
+      const definitions = fileNodes
         .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
         .sort((a, b) => a.startLine - b.startLine)
-        .slice(0, PINNED_FILE_NODE_CAP)
-        .forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
+        .slice(0, PINNED_FILE_NODE_CAP);
+      definitions.forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
+      // UE headers may consist entirely of includes. An explicit indexed path
+      // must still surface that file and its retained include candidates.
+      if (!definitions.length && cg.hasUeScopeProfile?.()) {
+        const anchor = fileNodes.find((n) => n.kind === 'file');
+        if (anchor) {
+          ueFileOnlyPins.add(fp);
+          if (!subgraph.nodes.has(anchor.id)) subgraph.nodes.set(anchor.id, anchor);
+        }
+      }
     }
 
     // A distinctive basename or an omitted UE U/A/F/I/E prefix still names
@@ -6686,6 +6696,13 @@ export class ToolHandler {
         ranges.push({ start: span.start, end, name: `lines ${span.start}-${end}`, kind: 'range', importance: EXACT_IMPORTANCE, spine: false });
       }
 
+      // A large include-only header has no definition ranges after dropping
+      // its whole-file envelope. Keep a bounded head when no line was named;
+      // explicit line anchors above continue to take precedence.
+      if (ranges.length === 0 && ueFileOnlyPins.has(filePath) && fileLines.length > 0) {
+        ranges.push({ start: 1, end: Math.min(fileLines.length, 80), name: 'file start',
+          kind: 'range', importance: EXACT_IMPORTANCE, spine: false });
+      }
       ranges.sort((a, b) => a.start - b.start);
 
       if (ranges.length === 0) {

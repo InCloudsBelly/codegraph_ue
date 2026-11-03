@@ -396,6 +396,85 @@ describe('UE engine source profile', () => {
     } finally { await reopened.destroy(); }
   }, 30000);
 
+  it('explores an explicitly named include-only UE header and its candidate target', async () => {
+    write('.codegraph/indexing.json', JSON.stringify({ ueEngine: { plugins: [] } }));
+    const file = 'Engine/Source/Runtime/Core/Public/OnlyIncludes.h';
+    const target = 'Engine/Source/Runtime/Core/Public/Other/Shared.h';
+    write(file, '#pragma once\n#include "Other/Shared.h"\n');
+    write(target, 'class FShared {};\n');
+    execFileSync('git', ['init', '-q'], { cwd: root, windowsHide: true });
+    const graph = CodeGraph.initSync(root);
+    const handler = new ToolHandler(graph);
+    try {
+      expect((await graph.indexAll()).success).toBe(true);
+      const answer = await handler.execute('codegraph_explore', { query: file, maxFiles: 1 });
+      const text = answer.content.map(part => part.type === 'text' ? part.text : '').join('\n');
+      expect(text).not.toContain('No relevant code found');
+      expect(text).toContain('#include "Other/Shared.h"');
+      expect(text).toContain(target);
+      expect(text).toContain('(candidates)');
+    } finally { await handler.closeAll(); graph.destroy(); }
+  }, 30000);
+
+  it('windows a large include-only UE header and honors an explicit line anchor', async () => {
+    write('.codegraph/indexing.json', JSON.stringify({ ueEngine: { plugins: [] } }));
+    const file = 'Engine/Source/Runtime/Core/Public/LargeIncludes.h';
+    const target = 'Engine/Source/Runtime/Core/Public/Other/Shared.h';
+    write(file, ['#pragma once', '#include "Other/Shared.h"', ...Array.from({ length: 300 }, (_, i) => `// marker ${i + 3}`)].join('\n'));
+    write(target, 'class FShared {};\n');
+    execFileSync('git', ['init', '-q'], { cwd: root, windowsHide: true });
+    const graph = CodeGraph.initSync(root);
+    const handler = new ToolHandler(graph);
+    try {
+      expect((await graph.indexAll()).success).toBe(true);
+      const text = async (query: string): Promise<string> =>
+        (await handler.execute('codegraph_explore', { query, maxFiles: 1 })).content
+          .map(part => part.type === 'text' ? part.text : '').join('\n');
+      const head = await text(file);
+      expect(head).toContain('#include "Other/Shared.h"');
+      expect(head).toContain(target);
+      expect(head).toContain('(candidates)');
+      expect(await text(`${file}:260`)).toContain('// marker 260');
+    } finally { await handler.closeAll(); graph.destroy(); }
+  }, 45000);
+
+  it('does not expose an excluded include-only header by explicitly naming its path', async () => {
+    const file = 'Engine/Source/Runtime/Core/Public/ExcludedIncludes.h';
+    write('.codegraph/indexing.json', JSON.stringify({ exclude: [file], ueEngine: { plugins: [] } }));
+    write(file, '#pragma once\n// EXCLUDED_PRIVATE_MARKER\n');
+    write('Engine/Source/Runtime/Core/Core.cpp', 'void RetainedEntry() {}\n');
+    execFileSync('git', ['init', '-q'], { cwd: root, windowsHide: true });
+    const graph = CodeGraph.initSync(root);
+    const handler = new ToolHandler(graph);
+    try {
+      expect((await graph.indexAll()).success).toBe(true);
+      expect(graph.getFile(file)).toBeNull();
+      const answer = await handler.execute('codegraph_explore', { query: file, maxFiles: 1 });
+      const text = answer.content.map(part => part.type === 'text' ? part.text : '').join('\n');
+      expect(text).not.toContain('EXCLUDED_PRIVATE_MARKER');
+    } finally { await handler.closeAll(); graph.destroy(); }
+  }, 30000);
+
+  it.runIf(process.platform === 'win32')('refuses a pinned UE path replaced by a Client junction', async () => {
+    write('.codegraph/indexing.json', JSON.stringify({ ueEngine: { plugins: [] } }));
+    const directory = 'Engine/Source/Runtime/Core/Public/Pinned';
+    const file = `${directory}/OnlyIncludes.h`;
+    write(file, '#pragma once\n#include "Other.h"\n');
+    write('Client/OnlyIncludes.h', '// CLIENT_PRIVATE_MARKER\n');
+    execFileSync('git', ['init', '-q'], { cwd: root, windowsHide: true });
+    const graph = CodeGraph.initSync(root);
+    const handler = new ToolHandler(graph);
+    try {
+      expect((await graph.indexAll()).success).toBe(true);
+      fs.renameSync(path.join(root, directory), path.join(root, `${directory}Saved`));
+      fs.symlinkSync(path.join(root, 'Client'), path.join(root, directory), 'junction');
+      const answer = await handler.execute('codegraph_explore', { query: file, maxFiles: 1 });
+      const text = answer.content.map(part => part.type === 'text' ? part.text : '').join('\n');
+      expect(text).toContain('cannot update the UE scope');
+      expect(text).not.toContain('CLIENT_PRIVATE_MARKER');
+    } finally { await handler.closeAll(); graph.destroy(); }
+  }, 30000);
+
   it('preserves an include written as a preprocessor expression without guessing a target', async () => {
     write('.codegraph/indexing.json', JSON.stringify({ ueEngine: { plugins: [] } }));
     const file = 'Engine/Source/Runtime/Core/Private/Use.cpp';
