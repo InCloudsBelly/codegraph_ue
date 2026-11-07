@@ -5,6 +5,8 @@
  */
 
 import type CodeGraph from '../index';
+import type { IndexOptions, SyncResult } from '../index';
+import { automaticSyncReason } from '../ue-automatic-error';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
@@ -64,7 +66,7 @@ import {
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges, measureCppIncludeEnvironment } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
-import { ueConditionsAtLine } from '../extraction/ue-conditions';
+import { ueConditionLookup } from '../extraction/ue-conditions';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -1553,6 +1555,15 @@ interface PropertySchema {
 /**
  * Tool execution result
  */
+/** @internal The in-process CLI consumer uses the same freshness boundary as MCP. */
+export interface UeReadOutcome {
+  onProgress?: IndexOptions['onProgress'];
+  signal?: AbortSignal;
+  sync?: SyncResult;
+  revision?: string;
+  reason?: string;
+}
+
 export interface ToolResult {
   content: Array<{
     type: 'text';
@@ -1952,7 +1963,9 @@ export class ToolHandler {
   private activeCalls = 0;
   private closing = false;
   private pendingCloses = 0;
-  private closeWaiters: Array<() => void> = [];
+  private projectClosePromises = new Set<Promise<void>>();
+  private closeWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  private closeFailure: Error | null = null;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -2355,7 +2368,7 @@ export class ToolHandler {
       }
     }
 
-    const open = () => loadCodeGraph().openSync(canonicalRoot);
+    const open = () => loadCodeGraph().openSync(canonicalRoot, { automaticOpen: 'query' });
     const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
     this.projectCache.set(canonicalRoot, cg);
     this.projectUsedAt.set(canonicalRoot, Date.now());
@@ -2413,26 +2426,58 @@ export class ToolHandler {
    */
   private trimProjects(): void {
     if (this.activeCalls > 0) return;
+    if (this.closing && this.closeFailure) return;
     const idleMs = resolveProjectIdleTimeoutMs();
     const now = Date.now();
     for (const [root, cg] of this.projectCache) {
       const idle = idleMs > 0 && now - (this.projectUsedAt.get(root) ?? now) >= idleMs;
       if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS && !idle) break;
       if (this.projectGates.has(cg)) continue;
-      this.projectCache.delete(root);
-      this.projectUsedAt.delete(root);
       if (this.projectLifecycle) {
+        this.projectCache.delete(root);
+        this.projectUsedAt.delete(root);
         this.pendingCloses++;
-        void Promise.resolve(this.projectLifecycle.release(cg)).finally(() => {
+        let failed = false;
+        let failure: unknown;
+        const closing = Promise.resolve().then(() => this.projectLifecycle!.release(cg)).catch(error => {
+          failed = true;
+          failure = error;
+          this.projectCache.set(root, cg);
+          this.projectUsedAt.set(root, Date.now());
+        }).finally(() => {
+          this.projectClosePromises.delete(closing);
           this.pendingCloses--;
-          this.trimProjects();
+          if (failed) {
+            this.recordProjectCloseFailure(failure);
+            if (!this.closing) this.scheduleIdleRelease(resolveProjectIdleTimeoutMs());
+          } else this.trimProjects();
         });
-      } else cg.close();
+        this.projectClosePromises.add(closing);
+      } else {
+        try { cg.close(); } catch (error) {
+          this.projectUsedAt.set(root, Date.now());
+          this.recordProjectCloseFailure(error);
+          if (this.closing) break;
+          continue;
+        }
+        this.projectCache.delete(root);
+        this.projectUsedAt.delete(root);
+      }
     }
     if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
-      for (const resolve of this.closeWaiters.splice(0)) resolve();
+      for (const waiter of this.closeWaiters.splice(0)) waiter.resolve();
     }
     this.scheduleIdleRelease(idleMs);
+  }
+
+  private recordProjectCloseFailure(error: unknown): void {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    if (this.closing) {
+      this.closeFailure = failure;
+      for (const waiter of this.closeWaiters.splice(0)) waiter.reject(failure);
+    } else {
+      process.stderr.write(`[CodeGraph MCP] Project close failed; retaining it for retry: ${failure.message}\n`);
+    }
   }
 
   /**
@@ -2485,13 +2530,15 @@ export class ToolHandler {
    */
   closeAll(): Promise<void> {
     this.closing = true;
+    this.closeFailure = null;
     this.worktreeMismatchCache.clear();
     if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
     this.idleReleaseTimer = null;
     this.nestedRepoCache.clear();
     this.trimProjects();
+    if (this.closeFailure) return Promise.reject(this.closeFailure);
     if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
-    return new Promise((resolve) => this.closeWaiters.push(resolve));
+    return new Promise((resolve, reject) => this.closeWaiters.push({ resolve, reject }));
   }
 
   /**
@@ -2689,12 +2736,23 @@ export class ToolHandler {
       const [head, ...tail] = result.content;
       if (!head || head.type !== 'text') return result;
       if (!answerFiles?.length) {
-        return { ...result, content: [{ type: 'text', text: `> UE static relationships may include unresolved source references; check scope status and the relevant source.\n\n${head.text}` }, ...tail] };
+        const health = cg.getIndexHealth();
+        const coverage = health.parseErrors.length || health.needsReindex.length
+          ? ` Index coverage includes ${health.parseErrors.length} parse errors and ${health.needsReindex.length} files needing reindex; missing relationships may be affected.`
+          : '';
+        return { ...result, content: [{ type: 'text', text: `> UE static relationships may include unresolved source references; check scope status and the relevant source.${coverage}\n\n${head.text}` }, ...tail] };
       }
       const notes: string[] = [];
       for (const { path: file } of answerFiles) {
-        const refs = cg.getUnresolvedReferencesInFile(file, 5000);
-        let imports: Node[] | undefined;
+        const errors = cg.getFile(file)?.errors ?? [];
+        if (errors.some(error => error.severity === 'error' || error.code === 'parse_error' || error.code === 'partial_parse')) {
+          notes.push(`- ${file}: parse error; symbols and relationships may be incomplete. Inspect the source.`);
+        } else if (errors.some(error => error.code === 'size_exceeded')) {
+          notes.push(`- ${file}: source exceeds the indexing size limit; symbols and relationships may be incomplete.`);
+        }
+        const available = Math.max(0, 8 - notes.length);
+        const refs = cg.getUeCandidatesInFile(file, available + 1);
+        let conditionsAt: ReturnType<typeof ueConditionLookup> | null | undefined;
         let source: string | undefined;
         const loadVerifiedSource = (): string | undefined => {
           if (source !== undefined) return source;
@@ -2709,33 +2767,39 @@ export class ToolHandler {
           } catch { return undefined; }
         };
         const conditionAt = (line: number): string => {
-          const text = loadVerifiedSource();
-          if (text === undefined) return ' [condition unavailable; inspect source]';
-          const conditions = ueConditionsAtLine(text, line);
+          if (conditionsAt === undefined) {
+            const text = loadVerifiedSource();
+            conditionsAt = text === undefined ? null : ueConditionLookup(text);
+          }
+          if (!conditionsAt) return ' [condition unavailable; inspect source]';
+          const conditions = conditionsAt(line);
           return conditions.length ? ` [condition: ${conditions.join(' && ')}]` : '';
         };
-        for (const ref of refs) {
-          if (ref.candidates?.length) {
-            const displayed = ref.candidates.slice(0, 5).join(', ');
-            const remaining = ref.candidates.length > 5 ? ` (+${ref.candidates.length - 5} more recorded)` : '';
-            notes.push(`- ${file}:${ref.line} — ${ref.referenceKind} ${ref.referenceName}: ${displayed}${remaining} (candidates)${conditionAt(ref.line)}`);
-          }
-          else if (ref.referenceKind === 'imports') {
-            imports ??= cg.getNodesInFile(file).filter(node => node.kind === 'import');
-            const site = imports.find(node => node.startLine === ref.line && node.name === ref.referenceName);
-            if (site?.signature && /^\s*#\s*include\s+[A-Za-z_]/.test(site.signature)) notes.push(`- ${file}:${ref.line} — ${site.signature} (preprocessor expression)${conditionAt(ref.line)}`);
-          }
-          if (notes.length >= 8) break;
+        for (const ref of refs.slice(0, available)) {
+          if (!ref.candidates?.length) continue;
+          const displayed = ref.candidates.slice(0, 5).join(', ');
+          const remaining = ref.candidates.length > 5 ? ` (+${ref.candidates.length - 5} more recorded)` : '';
+          notes.push(`- ${file}:${ref.line} — ${ref.referenceKind} ${ref.referenceName}: ${displayed}${remaining} (candidates)${conditionAt(ref.line)}`);
         }
+        if (refs.length > available) notes.push(`- ${file}: more candidate sites are available in the source.`);
         if (notes.length < 8) {
-          for (const node of cg.getNodesInFile(file)) {
+          const nodes = cg.getNodesInFile(file);
+          const shownImportLines = new Set(refs.filter(ref => ref.referenceKind === 'imports').map(ref => ref.line));
+          for (const node of nodes) {
+            if (node.kind === 'import' && node.signature && !shownImportLines.has(node.startLine) &&
+                /^\s*#\s*include\s+[A-Za-z_]/.test(node.signature)) {
+              notes.push(`- ${file}:${node.startLine} — ${node.signature} (preprocessor expression)${conditionAt(node.startLine)}`);
+              if (notes.length >= 8) break;
+            }
+          }
+          for (const node of nodes) {
+            if (notes.length >= 8) break;
             if (node.kind === 'file' || node.kind === 'import' || node.name.length < 3 || !head.text.includes(node.name)) continue;
             const condition = conditionAt(node.startLine);
             if (condition) notes.push(`- ${file}:${node.startLine} — ${node.qualifiedName}${condition}`);
             if (notes.length >= 8) break;
           }
         }
-        if (refs.length >= 5000) notes.push(`- ${file}: more references may be omitted; inspect the source.`);
         if (notes.length >= 8) break;
       }
       const modules = cg.getUeModuleRelations(answerFiles.map(answer => answer.path));
@@ -2866,10 +2930,21 @@ export class ToolHandler {
     toolName: string,
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
+    ueOutcome?: UeReadOutcome,
   ): Promise<ToolResult> {
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
     try {
+      // An evicted project's async close must settle before any new lookup:
+      // otherwise the same graph can be reopened while its previous lease is
+      // still being released, losing the original owner on failure.
+      if (this.projectClosePromises.size) {
+        const closed = await Promise.allSettled([...this.projectClosePromises]);
+        if (closed.some(result => result.status === 'rejected')) {
+          return this.textResult('A project close could not be completed safely; retry after the connection is recovered.');
+        }
+      }
+      if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
       // running. The wait is time-boxed (#905): a huge-repo reconcile takes
@@ -2914,23 +2989,33 @@ export class ToolHandler {
       }
 
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      const profile = project.getExistingIndexProfile();
+      if (profile === 'unverified' && toolName !== 'codegraph_status') {
+        if (ueOutcome) ueOutcome.reason = 'index-profile-unverified';
+        return this.errorResult('Cannot verify the active index profile. Check indexing configuration or inspect source directly.');
+      }
       // UE source profiles reconcile at the point of use, not in a persistent
       // watcher. A failed or unverifiable reconcile must not serve stale rows.
-      if (project.hasUeScopeProfile?.() && toolName !== 'codegraph_status') {
+      const ueRead = profile === 'ue' && toolName !== 'codegraph_status';
+      let ueRevision: string | null = null;
+      if (ueRead) {
         try {
-          await project.syncAutomatically();
-          const scope = await project.getUeScopeStatus();
-          if (!scope || scope.state !== 'fresh') {
-            return this.textResult(`CodeGraph cannot verify a fresh UE scope (${scope?.reason ?? 'unknown'}). Read the source directly and retry after a successful sync.`);
+          const sync = await project.reconcileUeRead(ueOutcome);
+          ueRevision = project.getUeReadRevision();
+          if (!ueRevision) {
+            if (ueOutcome) ueOutcome.reason = 'scope-state-changed-during-check';
+            return this.errorResult('CodeGraph cannot verify the indexed UE generation. Read the source directly and retry after a successful sync.');
           }
+          if (ueOutcome) ueOutcome.sync = sync;
         } catch (error) {
-          return this.textResult(`CodeGraph cannot update the UE scope: ${error instanceof Error ? error.message : String(error)}. Read the source directly and retry after a successful sync.`);
+          if (ueOutcome) ueOutcome.reason = automaticSyncReason(error);
+          return this.errorResult(`CodeGraph cannot update the UE scope: ${error instanceof Error ? error.message : String(error)}. Read the source directly and retry after a successful sync.`);
         }
       }
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).
-      if (project.rearmWatcherAfterLockContention?.()) {
+      if (profile === 'generic' && project.rearmWatcherAfterLockContention?.()) {
         process.stderr.write('[CodeGraph MCP] Re-armed file watcher; full catch-up pending.\n');
       }
 
@@ -2975,7 +3060,7 @@ export class ToolHandler {
         : await this.executeReadTool(toolName, dispatchArgs);
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
-      if (!raw.isError && answeredFrom && (project.hasUeScopeProfile?.() || wasDegraded || project.isWatcherDegraded?.())) {
+      if (!raw.isError && answeredFrom && (ueRead || wasDegraded || project.isWatcherDegraded?.())) {
         const validation = await validateAnswerFiles(project.getProjectRoot(), answeredFrom);
         if (validation.stale.length || validation.unchecked.length) {
           // Rejected source must not enter the session's emission history.
@@ -2993,15 +3078,32 @@ export class ToolHandler {
           // Text only: Claude Code shows the model a result's structuredContent
           // in place of its text (#2088). The text names every stale file and
           // the first unchecked ones; the rest only need a narrower query.
-          return this.textResult(lines.join('\n'));
+          if (ueOutcome && ueRead) ueOutcome.reason = 'answer-files-changed';
+          return ueRead ? this.errorResult(lines.join('\n')) : this.textResult(lines.join('\n'));
         }
       }
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
-      const result = this.takeExploreEmission(raw, sessionState);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withCppIncludeNotice(this.withStalenessNotice(withWorktree, args.projectPath as string | undefined), args.projectPath as string | undefined, answeredFrom);
+      const requestPath = args.projectPath as string | undefined;
+      const withWorktree = this.withWorktreeNotice(raw, requestPath);
+      const result = await this.withCppIncludeNotice(this.withStalenessNotice(withWorktree, requestPath), requestPath, answeredFrom);
+      if (ueRevision && !result.isError) {
+        // Check after collecting the answer. A new caller can live in a file
+        // absent from the old answer, so validating only its files is insufficient.
+        const scope = await project.getUeScopeStatus({ includeCoverage: false });
+        if (ueOutcome?.signal?.aborted) {
+          ueOutcome.reason = 'cancelled';
+          return this.errorResult('CodeGraph UE query was cancelled.');
+        }
+        if (scope?.state !== 'fresh' || project.getUeReadRevision() !== ueRevision) {
+          const reason = scope?.reason ?? 'scope-state-changed-during-check';
+          if (ueOutcome) ueOutcome.reason = reason;
+          return this.errorResult(`CodeGraph cannot verify a fresh UE scope (${reason}). Read the source directly and retry after a successful sync.`);
+        }
+        if (ueOutcome) ueOutcome.revision = ueRevision;
+      }
+      return this.takeExploreEmission(result, sessionState);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
@@ -8262,13 +8364,17 @@ export class ToolHandler {
     // filesystem fallback can stall on a large/busy checkout, but status must
     // not block the shared daemon's transport (#1959). Unknown is never zero.
     const lastIndexedAt = cg.getLastIndexedAt();
-    const ueScope = cg.hasUeScopeProfile?.() ? await cg.getUeScopeStatus() : null;
-    const changes = ueScope
-      ? ueScope.state === 'fresh' ? { added: 0, modified: 0, removed: 0 } : null
-      : await measurePendingChanges(cg.getProjectRoot());
-    if (ueScope) {
+    const profile = cg.getExistingIndexProfile();
+    const ueScope = profile === 'ue' ? await cg.getUeScopeStatus() : null;
+    const changes = profile === 'generic' ? await measurePendingChanges(cg.getProjectRoot())
+      : ueScope?.state === 'fresh' ? { added: 0, modified: 0, removed: 0 } : null;
+    if (profile === 'unverified') {
+      lines.push('**Index profile:** unverified. Check indexing configuration before querying this index.');
+    } else if (ueScope) {
       lines.push(`**UE scope:** ${ueScope.state}; plugin depth ${ueScope.depth ?? '?'} / ${ueScope.maxDepth ?? '?'}; ${ueScope.plugins.length} plugins; ${ueScope.unresolvedCount} candidate sites; ${ueScope.outsidePluginCandidates} sites reference unselected plugin candidates; ${ueScope.incompleteFiles.length} incompletely observed files.`);
       lines.push('**UE relationship coverage:** inferred from static source; ambiguous targets remain candidates and deeper plugin dependencies may be unexpanded.');
+      const health = cg.getIndexHealth();
+      lines.push(`**UE parse errors:** ${health.parseErrors.length}; files needing reindex: ${health.needsReindex.length}. Freshness does not guarantee complete extraction.`);
     } else if (cg.hasCppIncludeFiles?.()) {
       const environment = await measureCppIncludeEnvironment(cg.getProjectRoot());
       const inputsVerified = environment?.observed && environment.inputsVerified === true && !environment.changed;

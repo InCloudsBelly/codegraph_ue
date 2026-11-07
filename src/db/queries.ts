@@ -45,6 +45,14 @@ function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): bool
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
 
+// Imports can change with the header catalog; an empty symbol candidate can
+// become resolvable through context. Both must be rechecked on every UE sync.
+import type { UeObservedSource, UeScopeObservationCache } from '../extraction/ue-engine-scope';
+
+const UE_OBSERVATION_CONFIG_KEY = 'ue_source_observation_config_v1';
+const UE_EMPTY_SYMBOL_CANDIDATES = "language IN ('c', 'cpp') AND reference_kind IN ('calls', 'extends', 'implements', 'references') AND candidates = '[]'";
+const UE_DYNAMIC_CANDIDATES = "language IN ('c', 'cpp') AND (reference_kind = 'imports' OR (reference_kind IN ('calls', 'extends', 'implements', 'references') AND candidates = '[]'))";
+
 /**
  * How an import names a folder only through where it is written: `.`, or a
  * folder up to twelve levels above (`..`, `../..`, with or without the
@@ -3016,9 +3024,12 @@ export class QueryBuilder {
   /** Persist static candidates separately from trusted graph edges. */
   updateUeCandidates(refs: readonly { rowId: number; candidates: string[] }[]): void {
     if (!refs.length) return;
-    const stmt = this.db.prepare("UPDATE unresolved_refs SET candidates = ? WHERE id = ? AND reference_kind IN ('imports', 'calls', 'extends', 'implements') AND language IN ('c', 'cpp')");
+    const stmt = this.db.prepare("UPDATE unresolved_refs SET candidates = ? WHERE id = ? AND reference_kind IN ('imports', 'calls', 'extends', 'implements', 'references') AND language IN ('c', 'cpp') AND candidates IS NOT ?");
     this.runInTransaction(() => {
-      for (const ref of refs) stmt.run(JSON.stringify(ref.candidates), ref.rowId);
+      for (const ref of refs) {
+        const candidates = JSON.stringify(ref.candidates);
+        stmt.run(candidates, ref.rowId, candidates);
+      }
     });
   }
 
@@ -3026,7 +3037,7 @@ export class QueryBuilder {
     if (!refs.length) return;
     const pathMatch = process.platform === 'win32' ? 'file_path = ? COLLATE NOCASE' : 'file_path = ?';
     const select = this.db.prepare(`SELECT id, candidates FROM unresolved_refs WHERE ${pathMatch} AND line = ? AND reference_name = ? AND reference_kind = 'imports' AND language IN ('c', 'cpp')`);
-    const update = this.db.prepare('UPDATE unresolved_refs SET candidates = ? WHERE id = ?');
+    const update = this.db.prepare('UPDATE unresolved_refs SET candidates = ? WHERE id = ? AND candidates IS NOT ?');
     this.runInTransaction(() => {
       for (const ref of refs) {
         const rows = select.all(ref.file, ref.line, ref.include) as Array<{ id: number; candidates: string | null }>;
@@ -3038,16 +3049,40 @@ export class QueryBuilder {
           const truncated = paths.length > 32 || combined.some(candidate => candidate.startsWith('… '));
           const candidates = paths.slice(0, 32);
           if (truncated) candidates.push('… additional candidates omitted; narrow the source scope');
-          update.run(JSON.stringify(candidates), row.id);
+          const serialized = JSON.stringify(candidates);
+          update.run(serialized, row.id, serialized);
         }
       }
     });
   }
 
-  getUeCandidateReferencesAfter(after: number, limit: number): UnresolvedReference[] {
-    const rows = this.db.prepare(
-      "SELECT * FROM unresolved_refs WHERE id > ? AND language IN ('c', 'cpp') AND (reference_kind = 'imports' OR (reference_kind IN ('calls', 'extends', 'implements') AND candidates IS NOT NULL)) ORDER BY id LIMIT ?"
-    ).all(after, limit) as UnresolvedRefRow[];
+  ensureUeDynamicCandidateIndex(): void {
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ue_dynamic_candidates ON unresolved_refs(id) WHERE ${UE_DYNAMIC_CANDIDATES};
+      CREATE INDEX IF NOT EXISTS idx_ue_empty_symbol_candidates ON unresolved_refs(id) WHERE ${UE_EMPTY_SYMBOL_CANDIDATES}`);
+  }
+
+  getUeCandidateReferencesAfter(after: number, limit: number, dynamicOnly = false, localImports = false): UnresolvedReference[] {
+    const sql = localImports
+      ? `SELECT * FROM unresolved_refs INDEXED BY idx_ue_empty_symbol_candidates WHERE id > ? AND ${UE_EMPTY_SYMBOL_CANDIDATES} ORDER BY id LIMIT ?`
+      : dynamicOnly
+        ? `SELECT * FROM unresolved_refs INDEXED BY idx_ue_dynamic_candidates WHERE id > ? AND ${UE_DYNAMIC_CANDIDATES} ORDER BY id LIMIT ?`
+        : "SELECT * FROM unresolved_refs WHERE id > ? AND language IN ('c', 'cpp') AND (reference_kind = 'imports' OR (reference_kind IN ('calls', 'extends', 'implements', 'references') AND candidates IS NOT NULL)) ORDER BY id LIMIT ?";
+    return this.ueCandidateRows(this.db.prepare(sql).all(after, limit) as UnresolvedRefRow[]);
+  }
+
+  getUeImportsInFileAfter(file: string, after: number, limit: number): UnresolvedReference[] {
+    const rows = this.db.prepare("SELECT * FROM unresolved_refs WHERE file_path = ? AND id > ? AND reference_kind = 'imports' AND language IN ('c', 'cpp') ORDER BY id LIMIT ?")
+      .all(file, after, limit) as UnresolvedRefRow[];
+    return this.ueCandidateRows(rows);
+  }
+
+  hasFileNode(file: string): boolean {
+    const row = this.db.prepare("SELECT EXISTS(SELECT 1 FROM nodes WHERE file_path = ? AND kind = 'file') AS present")
+      .get(file) as { present: number };
+    return row.present === 1;
+  }
+
+  private ueCandidateRows(rows: UnresolvedRefRow[]): UnresolvedReference[] {
     return rows.map(row => ({
       fromNodeId: row.from_node_id, referenceName: row.reference_name, referenceKind: row.reference_kind as EdgeKind,
       line: row.line, column: row.col, candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
@@ -3055,8 +3090,14 @@ export class QueryBuilder {
     }));
   }
 
+  getUeCandidatesInFile(file: string, limit: number): UnresolvedReference[] {
+    const rows = this.db.prepare("SELECT * FROM unresolved_refs WHERE file_path = ? AND candidates IS NOT NULL AND candidates <> '[]' ORDER BY line, col LIMIT ?")
+      .all(file, limit) as UnresolvedRefRow[];
+    return this.ueCandidateRows(rows);
+  }
+
   getUeCandidateCount(): number {
-    const row = this.db.prepare("SELECT COUNT(*) AS count FROM unresolved_refs WHERE reference_kind IN ('imports', 'calls', 'extends', 'implements') AND language IN ('c', 'cpp') AND candidates IS NOT NULL AND candidates <> '[]'").get() as { count: number };
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM unresolved_refs WHERE reference_kind IN ('imports', 'calls', 'extends', 'implements', 'references') AND language IN ('c', 'cpp') AND candidates IS NOT NULL AND candidates <> '[]'").get() as { count: number };
     return row.count;
   }
 
@@ -3724,6 +3765,44 @@ export class QueryBuilder {
   /**
    * Get all tracked files
    */
+  seedUeSourceObservations(signature: string, cache: UeScopeObservationCache): void {
+    if (this.getMetadata(UE_OBSERVATION_CONFIG_KEY) !== signature) return;
+    const rows = this.db.prepare('SELECT path, observation FROM ue_source_observations').iterate() as Iterable<{
+      path: string; observation: string;
+    }>;
+    for (const row of rows) {
+      const value = safeJsonParse<UeObservedSource | null>(row.observation, null);
+      if (value && typeof value.stamp === 'string' && /^[0-9a-f]{64}$/.test(value.hash) &&
+          Number.isFinite(value.bytes) && value.bytes > 0 && typeof value.acceptable === 'boolean' &&
+          typeof value.readable === 'boolean' && (value.includes === undefined ||
+            Array.isArray(value.includes) && value.includes.every(site => site && typeof site.spec === 'string' && Number.isInteger(site.line)))) {
+        cache.seed(row.path, value);
+      }
+    }
+  }
+
+  /** Called in the same commit as the verified UE scope. */
+  saveUeSourceObservations(signature: string, cache: UeScopeObservationCache,
+    sources: ReadonlyMap<string, string>, layoutChanged: boolean): void {
+    this.db.exec('CREATE TABLE IF NOT EXISTS ue_source_observations (path TEXT PRIMARY KEY, observation TEXT NOT NULL)');
+    if (this.getMetadata(UE_OBSERVATION_CONFIG_KEY) !== signature) {
+      this.db.exec('DELETE FROM ue_source_observations');
+      this.setMetadata(UE_OBSERVATION_CONFIG_KEY, signature);
+    } else if (layoutChanged) {
+      const remove = this.db.prepare('DELETE FROM ue_source_observations WHERE path = ?');
+      const paths = this.db.prepare('SELECT path FROM ue_source_observations').all() as { path: string }[];
+      for (const { path } of paths) if (!sources.has(path)) remove.run(path);
+    }
+    const store = this.db.prepare('INSERT INTO ue_source_observations (path, observation) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET observation = excluded.observation');
+    for (const [file, value] of cache.changes()) {
+      if (sources.get(file) === value.hash) store.run(file, JSON.stringify(value));
+    }
+  }
+
+  getAllFileHashes(): { path: string; contentHash: string }[] {
+    return this.db.prepare('SELECT path, content_hash AS contentHash FROM files').all() as { path: string; contentHash: string }[];
+  }
+
   getAllFiles(): FileRecord[] {
     if (!this.stmts.getAllFiles) {
       this.stmts.getAllFiles = this.db.prepare('SELECT * FROM files ORDER BY path');
@@ -4084,6 +4163,35 @@ export class QueryBuilder {
     }));
   }
 
+  /** Count a bounded set of files without loading their reference rows. */
+  getPendingReferenceCountByFiles(filePaths: readonly string[]): number {
+    if (!filePaths.length) return 0;
+    const placeholders = filePaths.map(() => '?').join(',');
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`
+    ).get(...filePaths) as { count: number };
+    return row.count;
+  }
+
+  /** Read one bounded page, keeping prerequisites ahead of dependent calls. */
+  getPendingReferencesByFilesAfter(
+    filePaths: readonly string[], afterRowId: number, limit: number, prerequisites: boolean
+  ): UnresolvedReference[] {
+    if (!filePaths.length) return [];
+    const placeholders = filePaths.map(() => '?').join(',');
+    const filter = prerequisites ? 'IN' : 'NOT IN';
+    const rows = this.db.prepare(
+      `SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})
+       AND id > ? AND reference_kind ${filter} ('imports', 'extends', 'implements') ORDER BY id LIMIT ?`
+    ).all(...filePaths, afterRowId, limit) as UnresolvedRefRow[];
+    return rows.map(row => ({
+      fromNodeId: row.from_node_id, referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind, line: row.line, column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path, language: row.language as Language, rowId: row.id,
+    }));
+  }
+
   /**
    * Delete all unresolved references (after resolution)
    */
@@ -4200,15 +4308,16 @@ export class QueryBuilder {
    * can differ per call site (receiver-type inference reads the ref's line),
    * so a sibling must not inherit this row's failure.
    */
-  markReferencesFailedByRowIds(refs: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }>): number {
+  markReferencesFailedByRowIds(refs: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }>, onlyIfChanged = false): number {
     if (refs.length === 0) return 0;
-    const stmt = this.db.prepare(
-      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?"
-    );
+    const stmt = this.db.prepare(onlyIfChanged
+      ? "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ? AND (status IS NOT 'failed' OR name_tail IS NOT ?)"
+      : "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?");
     let changed = 0;
     const markMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        changed += stmt.run(ref.nameTail ?? referenceNameTail(ref.referenceName, ref.referenceKind), ref.rowId).changes;
+        const tail = ref.nameTail ?? referenceNameTail(ref.referenceName, ref.referenceKind);
+        changed += (onlyIfChanged ? stmt.run(tail, ref.rowId, tail) : stmt.run(tail, ref.rowId)).changes;
       }
     });
     markMany(refs);
@@ -4402,10 +4511,12 @@ export class QueryBuilder {
       }
       // A key past the ceiling: only the imports that could name an added file.
       for (const key of crowdedKeys) {
-        const keyRows = this.db
-          .prepare(`SELECT * FROM unresolved_refs WHERE ${where} AND ${column} IN (?)`)
-          .all(key) as UnresolvedRefRow[];
-        const named = keyRows.filter((row) => couldName!(toReference(row)));
+        const named: UnresolvedRefRow[] = [];
+        const keyRows = this.db.prepare(`SELECT * FROM unresolved_refs WHERE ${where} AND ${column} IN (?)`).iterate(key);
+        for (const row of keyRows as Iterable<UnresolvedRefRow>) {
+          if (couldName!(toReference(row))) named.push(row);
+          if (named.length > perModuleCeiling) break;
+        }
         if (named.length > perModuleCeiling) continue;
         for (const row of named) rows.set(row.id, row);
       }
@@ -4430,6 +4541,85 @@ export class QueryBuilder {
       )
       .all() as Array<{ name: string; file_path: string; language: Language }>)
       .map((row) => ({ name: row.name, filePath: row.file_path, language: row.language }));
+  }
+
+  getFailedScopedImportsAfter(after: string, limit: number): Array<{ name: string; filePath: string; language: Language }> {
+    return (this.db.prepare(
+      `SELECT reference_name AS name, MIN(file_path) AS file_path, language FROM unresolved_refs
+       WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name > ?
+         AND reference_name GLOB '@?*/?*' AND reference_name NOT GLOB '@*/*/*'
+       GROUP BY reference_name ORDER BY reference_name LIMIT ?`
+    ).all(after, limit) as Array<{ name: string; file_path: string; language: Language }>)
+      .map(row => ({ name: row.name, filePath: row.file_path, language: row.language }));
+  }
+
+  getFailedFolderImportsAfter(after: number, limit: number): UnresolvedReference[] {
+    const placeholders = FOLDER_SPECIFIERS.map(() => '?').join(',');
+    return (this.db.prepare(
+      `SELECT * FROM unresolved_refs WHERE status = 'failed' AND reference_kind = 'imports'
+       AND reference_name IN (${placeholders}) AND id > ? ORDER BY id LIMIT ?`
+    ).all(...FOLDER_SPECIFIERS, after, limit) as UnresolvedRefRow[]).map(row => ({
+      fromNodeId: row.from_node_id, referenceName: row.reference_name, referenceKind: row.reference_kind as EdgeKind,
+      line: row.line, column: row.col, candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path, language: row.language as Language, rowId: row.id,
+    }));
+  }
+
+  clearUeRetryQueue(): void { this.db.exec('DELETE FROM ue_sync_retry_queue'); }
+
+  /** Page a UE name's failed refs without the generic popularity ceiling. */
+  getUeFailedReferencesAfterTail(name: string, after: number, limit: number): UnresolvedReference[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM unresolved_refs WHERE status = 'failed' AND name_tail = ? AND id > ?
+       AND language IN ('c', 'cpp') ORDER BY id LIMIT ?`
+    ).all(name, after, limit) as UnresolvedRefRow[];
+    return rows.map(row => ({
+      fromNodeId: row.from_node_id, referenceName: row.reference_name, referenceKind: row.reference_kind as EdgeKind,
+      line: row.line, column: row.col, candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path, language: row.language as Language, rowId: row.id,
+    }));
+  }
+
+  /** Candidate symbols whose definition or source location may have changed. */
+  getUeCandidateReferencesAfterTail(name: string, after: number, limit: number): UnresolvedReference[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM unresolved_refs WHERE status = 'failed' AND name_tail = ? AND id > ?
+       AND language IN ('c', 'cpp') AND reference_kind IN ('calls', 'extends', 'implements', 'references')
+       AND candidates IS NOT NULL ORDER BY id LIMIT ?`
+    ).all(name, after, limit) as UnresolvedRefRow[];
+    return rows.map(row => ({
+      fromNodeId: row.from_node_id, referenceName: row.reference_name, referenceKind: row.reference_kind as EdgeKind,
+      line: row.line, column: row.col, candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path, language: row.language as Language, rowId: row.id,
+    }));
+  }
+
+  enqueueUeRetryReferences(refs: readonly UnresolvedReference[]): void {
+    if (!refs.length) return;
+    const insert = this.db.prepare('INSERT OR IGNORE INTO ue_sync_retry_queue (row_id) VALUES (?)');
+    this.runInTransaction(() => {
+      for (const ref of refs) {
+        if (ref.rowId == null) throw new Error('Cannot queue a failed reference without its row ID.');
+        insert.run(ref.rowId);
+      }
+    });
+  }
+
+  getUeRetryCount(): number {
+    return (this.db.prepare('SELECT COUNT(*) AS count FROM ue_sync_retry_queue').get() as { count: number }).count;
+  }
+
+  getUeRetryReferencesAfter(after: number, limit: number, prerequisites: boolean): UnresolvedReference[] {
+    const filter = prerequisites ? 'IN' : 'NOT IN';
+    return (this.db.prepare(
+      `SELECT r.* FROM ue_sync_retry_queue q JOIN unresolved_refs r ON r.id = q.row_id
+       WHERE q.row_id > ? AND r.reference_kind ${filter} ('imports', 'extends', 'implements')
+       ORDER BY q.row_id LIMIT ?`
+    ).all(after, limit) as UnresolvedRefRow[]).map(row => ({
+      fromNodeId: row.from_node_id, referenceName: row.reference_name, referenceKind: row.reference_kind as EdgeKind,
+      line: row.line, column: row.col, candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path, language: row.language as Language, rowId: row.id,
+    }));
   }
 
   /**
@@ -5101,29 +5291,32 @@ export class QueryBuilder {
     return [...names];
   }
 
+  /** Bound the changed-name set; a larger edit falls back to a full refresh. */
+  getUeNodeNamesByFilesBounded(filePaths: readonly string[], limit: number): string[] {
+    if (!filePaths.length) return [];
+    const rows = this.db.prepare(
+      'SELECT DISTINCT name FROM nodes WHERE file_path IN (SELECT value FROM json_each(?)) LIMIT ?'
+    ).all(JSON.stringify(filePaths), limit) as Array<{ name: string }>;
+    return rows.map(row => row.name);
+  }
+
   /**
-   * Distinct `file\0name` pairs defined by the given files — the shape sync's
-   * definition delta needs (CG-33).
-   *
-   * Deliberately NOT `getNodeNamesByFiles`: a bare name set is taken over the
-   * WHOLE changed batch, so a name that moves between two files in one commit
-   * (or exists in one changed file and is newly added to another) appears on
-   * both sides and cancels out of the symmetric difference — even though a
-   * definition genuinely appeared or vanished and every reference to that name
-   * repo-wide may now bind elsewhere. Keying by file makes each definition its
-   * own fact, so the move is seen as one removal plus one addition.
+   * Stable per-file definition identities for sync's name invalidation.
+   * Count identical identities as well: adding an overload or another scoped
+   * definition in the same file must invalidate existing references.
    */
-  getNodeNamePairsByFiles(filePaths: string[]): Set<string> {
+  getNodeDefinitionFingerprintsByFiles(filePaths: string[]): Set<string> {
     const pairs = new Set<string>();
     if (filePaths.length === 0) return pairs;
     for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
-        .prepare(`SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (${placeholders})`)
-        .all(...chunk) as Array<{ file_path: string; name: string }>;
-      // NUL-joined: a path or a symbol name can contain a space, never a NUL.
-      for (const row of rows) pairs.add(`${row.file_path}\0${row.name}`);
+        .prepare(`SELECT file_path, name, kind, qualified_name, signature, decorators, COUNT(*) AS count
+          FROM nodes WHERE file_path IN (${placeholders})
+          GROUP BY file_path, name, kind, qualified_name, signature, decorators`)
+        .all(...chunk) as Array<{ file_path: string; name: string; kind: string; qualified_name: string; signature: string | null; decorators: string | null; count: number }>;
+      for (const row of rows) pairs.add(JSON.stringify([row.file_path, row.name, row.kind, row.qualified_name, row.signature, row.decorators, row.count]));
     }
     return pairs;
   }

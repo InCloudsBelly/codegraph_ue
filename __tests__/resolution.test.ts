@@ -2351,6 +2351,31 @@ func main() {
       expect(afterClear.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
     });
 
+    it('bounds method owner indexes and preserves matches after eviction', async () => {
+      const previousLimit = process.env.CODEGRAPH_RESOLVER_CACHE_SIZE;
+      process.env.CODEGRAPH_RESOLVER_CACHE_SIZE = '2';
+      try {
+        fs.writeFileSync(path.join(tempDir, 'cache.ts'),
+          'class Logger { one() {} two() {} three() {} }\n');
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+        resolver.clearCaches();
+        const ctx = (resolver as unknown as { context: ResolutionContext }).context;
+        for (const name of ['one', 'two', 'three']) {
+          expect(ctx.getMethodMatches!('Logger', name, 'typescript').map(n => n.qualifiedName))
+            .toEqual([`Logger::${name}`]);
+        }
+        const owners = (resolver as unknown as { methodOwnerIndexCache: { size: number } }).methodOwnerIndexCache;
+        expect(owners.size).toBeLessThanOrEqual(2);
+        expect(ctx.getMethodMatches!('Logger', 'one', 'typescript').map(n => n.qualifiedName))
+          .toEqual(['Logger::one']);
+        expect(owners.size).toBeLessThanOrEqual(2);
+      } finally {
+        if (previousLimit === undefined) delete process.env.CODEGRAPH_RESOLVER_CACHE_SIZE;
+        else process.env.CODEGRAPH_RESOLVER_CACHE_SIZE = previousLimit;
+      }
+    });
+
     it('resolveBatchYielding offers a yield checkpoint for every ref', async () => {
       fs.writeFileSync(
         path.join(tempDir, 'a.ts'),

@@ -51,6 +51,7 @@ export interface ParseTask {
   content: string;
   language: Language;
   frameworkNames?: string[];
+  ueCppDeclarations?: boolean;
 }
 
 /** Default upper bound on the pool size derived from the core count. */
@@ -422,6 +423,7 @@ export class ParseWorkerPool {
       content: job.task.content,
       frameworkNames: job.task.frameworkNames,
       language: job.task.language,
+      ueCppDeclarations: job.task.ueCppDeclarations,
     });
   }
 

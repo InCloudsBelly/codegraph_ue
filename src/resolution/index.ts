@@ -36,6 +36,8 @@ import { CppIncludeEnvironment } from './cpp-include-environment';
 import type { CppIncludeQuote, CppIncludeResolution } from './cpp-include-environment';
 import { loadIndexingConfig } from '../indexing-config';
 import { maskUeTestOnlyCode } from '../extraction/ue-test-scope';
+import { UE_CPP_DECLARATION } from '../extraction/ue-cpp-declarations';
+import { cppFreeFunctionKey } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -277,8 +279,9 @@ export class ReferenceResolver {
   // method name's candidates by their qualifiedName's last two segments so a
   // (type, method) query is a lookup instead of an O(candidates) filter per
   // methodMatchCache miss. Derived purely from node rows (stable through the
-  // resolution loop, same window nameCache relies on); dropped in clearCaches.
-  private methodOwnerIndexCache = new Map<string, Map<string, Node[]>>();
+  // resolution loop, same window nameCache relies on); bounded independently
+  // so evicted name-cache entries cannot be retained for the entire run.
+  private methodOwnerIndexCache: LRUCache<string, Map<string, Node[]>>;
   // Generation-tagged memo for getSupertypes. Supertype edges GROW during the
   // resolution loop (batch k persists its implements/extends edges BEFORE
   // batch k+1 fans out — the #1320 ordering), so a plain cache would freeze an
@@ -361,6 +364,7 @@ export class ReferenceResolver {
     this.fileLinesCache = new LRUCache(contentLimit);
     this.nodeByIdCache = new LRUCache(Math.max(limit * 4, 20_000));
     this.methodMatchCache = new LRUCache(limit);
+    this.methodOwnerIndexCache = new LRUCache(limit);
 
     this.context = this.createContext();
   }
@@ -1445,6 +1449,7 @@ export class ReferenceResolver {
   }
 
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    if (this.ueStaticProfile && this.retainUeDeclarationTypeCandidates(ref)) return null;
     // A C/C++ "call" whose name is a function-like macro visible in this
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
@@ -1494,6 +1499,13 @@ export class ReferenceResolver {
 
     const target = this.nodeById(resolved.targetNodeId);
     if (!target) return resolved;
+    if (this.ueStaticProfile && target.decorators?.includes(UE_CPP_DECLARATION)) {
+      const key = cppFreeFunctionKey(target, this.context);
+      const definitions = key === null ? [] : this.context.getNodesByName(target.name).filter(node =>
+        !node.decorators?.includes(UE_CPP_DECLARATION) && node.filePath === target.filePath &&
+        cppFreeFunctionKey(node, this.context) === key);
+      if (definitions.length === 1) return { ...resolved, targetNodeId: definitions[0]!.id };
+    }
 
     const dot = ref.referenceName.lastIndexOf('.');
     const memberName = dot >= 0 ? ref.referenceName.slice(dot + 1) : null;
@@ -1505,6 +1517,20 @@ export class ReferenceResolver {
       targetNodeId: forwarded.id,
       confidence: Math.min(resolved.confidence, 0.85),
     }, ref);
+  }
+
+  /** Type positions in UE function declarations are source facts, not proof of visibility. */
+  private retainUeDeclarationTypeCandidates(ref: UnresolvedRef): boolean {
+    if ((ref.language !== 'c' && ref.language !== 'cpp') || ref.referenceKind !== 'references' ||
+        !this.nodeById(ref.fromNodeId)?.decorators?.includes(UE_CPP_DECLARATION)) return false;
+    const name = ref.referenceName.split('::').pop() ?? '';
+    const candidates = this.context.getNodesByName(name).filter(node =>
+      (node.language === 'c' || node.language === 'cpp') &&
+      ['class', 'struct', 'union', 'enum', 'interface', 'type_alias'].includes(node.kind))
+      .map(node => `${node.filePath}:${node.startLine} ${node.qualifiedName}`).sort();
+    ref.candidates = candidates.slice(0, 32);
+    if (candidates.length > 32) ref.candidates.push(`… ${candidates.length - 32} more candidates; narrow the source scope`);
+    return true;
   }
 
   /** Do not choose an arbitrary same-named C++ call or supertype target. */
@@ -1519,6 +1545,7 @@ export class ReferenceResolver {
       (node.language === 'c' || node.language === 'cpp') && (isCall
         ? node.kind === 'function' || node.kind === 'method'
         : node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface'));
+    if (isCall) candidates = this.collapseUeFunctionDeclarations(candidates);
     if (original.includes('::')) {
       candidates = candidates.filter(node => node.qualifiedName === original || node.qualifiedName.endsWith(`::${original}`));
     }
@@ -1546,12 +1573,31 @@ export class ReferenceResolver {
     return false;
   }
 
+  /** Only a declaration and unique definition in the same file can be paired without build context. */
+  private collapseUeFunctionDeclarations(candidates: Node[]): Node[] {
+    if (!candidates.some(node => node.decorators?.includes(UE_CPP_DECLARATION))) return candidates;
+    const definitions = new Map<string, number>();
+    for (const node of candidates) {
+      if (node.decorators?.includes(UE_CPP_DECLARATION)) continue;
+      const key = cppFreeFunctionKey(node, this.context);
+      if (key !== null) {
+        const localKey = JSON.stringify([node.filePath, key]);
+        definitions.set(localKey, (definitions.get(localKey) ?? 0) + 1);
+      }
+    }
+    return candidates.filter(node => {
+      if (!node.decorators?.includes(UE_CPP_DECLARATION)) return true;
+      const key = cppFreeFunctionKey(node, this.context);
+      return key === null || definitions.get(JSON.stringify([node.filePath, key])) !== 1;
+    });
+  }
+
   /** Names whose new definitions require rechecking existing UE relations. */
   getAmbiguousUeTargetNames(names: readonly string[]): string[] {
     if (!this.ueStaticProfile) return [];
     return [...new Set(names)].filter(name => {
       let calls = 0, types = 0;
-      for (const node of this.context.getNodesByName(name)) {
+      for (const node of this.collapseUeFunctionDeclarations(this.context.getNodesByName(name))) {
         if (node.language !== 'c' && node.language !== 'cpp') continue;
         if (node.kind === 'function' || node.kind === 'method') calls++;
         else if (node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface') types++;
@@ -2036,21 +2082,51 @@ export class ReferenceResolver {
   private persistUeIncludeCandidates(unresolved: readonly UnresolvedRef[]): void {
     if (!this.ueStaticProfile) return;
     this.queries.updateUeCandidates(unresolved.filter(ref =>
-      ref.rowId != null && ref.candidates !== undefined && ['imports', 'calls', 'extends', 'implements'].includes(ref.referenceKind) &&
+      ref.rowId != null && ref.candidates !== undefined && ['imports', 'calls', 'extends', 'implements', 'references'].includes(ref.referenceKind) &&
       (ref.language === 'c' || ref.language === 'cpp'))
       .map(ref => ({ rowId: ref.rowId!, candidates: ref.candidates! })));
   }
 
-  /** Re-evaluate retained candidates after indexed headers are added or removed. */
-  async refreshUeIncludeCandidates(): Promise<void> {
+  /** Re-evaluate candidates under the verified file layout and name invalidation. */
+  async refreshUeIncludeCandidates(changedNames?: readonly string[], onProgress?: (checked: number) => void,
+    changedImports?: readonly string[]): Promise<void> {
     if (!this.ueStaticProfile) return;
+    let checked = 0;
+    onProgress?.(checked);
     let after = 0;
     for (;;) {
-      const batch = this.queries.getUeCandidateReferencesAfter(after, 1000);
-      if (!batch.length) return;
+      const batch = this.queries.getUeCandidateReferencesAfter(after, 1000, changedNames !== undefined, changedImports !== undefined);
+      if (!batch.length) break;
       after = batch[batch.length - 1]!.rowId!;
       await this.resolveAndPersistListYielding(batch);
+      checked += batch.length;
+      onProgress?.(checked);
       await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    for (const file of changedImports ?? []) {
+      after = 0;
+      for (;;) {
+        const batch = this.queries.getUeImportsInFileAfter(file, after, 500);
+        if (!batch.length) break;
+        after = batch[batch.length - 1]!.rowId!;
+        await this.resolveAndPersistListYielding(batch);
+        checked += batch.length;
+        onProgress?.(checked);
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    }
+    if (changedNames === undefined) return;
+    for (const name of changedNames) {
+      after = 0;
+      for (;;) {
+        const batch = this.queries.getUeCandidateReferencesAfterTail(name, after, 500);
+        if (!batch.length) break;
+        after = batch[batch.length - 1]!.rowId!;
+        await this.resolveAndPersistListYielding(batch);
+        checked += batch.length;
+        onProgress?.(checked);
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
     }
   }
 
@@ -2062,6 +2138,14 @@ export class ReferenceResolver {
    * are still cached from the attempt — in a resolver-pool worker too.
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
+    if (this.ueStaticProfile && (ref.language === 'c' || ref.language === 'cpp') &&
+        (['calls', 'extends', 'implements'].includes(ref.referenceKind) || (ref.referenceKind === 'references' && ref.candidates !== undefined))) {
+      // The same final identifier retainAmbiguousUeTargets uses must also be
+      // the indexed retry key, including receiver arrows and written arity.
+      const name = ref.referenceName.replace(/\/\d+$/, '').split(/::|->|\./).pop() ?? '';
+      if (/^[A-Za-z_]\w*$/.test(name)) ref.nameTail = name;
+      return ref;
+    }
     const tail = importBindingTail(ref, this.context);
     if (tail) ref.nameTail = tail;
     return ref;
@@ -2122,7 +2206,7 @@ export class ReferenceResolver {
     if (result.unresolved.length > 0) {
       this.persistUeIncludeCandidates(result.unresolved);
       const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
-      this.queries.markReferencesFailedByRowIds(byRowId);
+      this.queries.markReferencesFailedByRowIds(byRowId, this.ueStaticProfile);
       this.queries.markReferencesFailed(legacyKeys);
     }
 
@@ -2172,7 +2256,7 @@ export class ReferenceResolver {
     this.persistUeIncludeCandidates(result.unresolved);
     const failedCleanup = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
     for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
-      this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+      this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK), this.ueStaticProfile);
       await maybeYield();
     }
     for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
@@ -2533,6 +2617,7 @@ export class ReferenceResolver {
     // costs zero wall-clock. Any failure downgrades to sequential permanently.
     let pool: ResolverPool | null = null;
     let poolReady = false;
+    let failedPoolCleanup: Promise<void> | undefined;
     // True once pool creation has been attempted by EITHER engage site (the
     // up-front ref-count gate or the adaptive projection below) — a pool that
     // failed or was destroyed must stay down (downgrade is permanent), and
@@ -2549,7 +2634,7 @@ export class ReferenceResolver {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] pool ready after ${Date.now() - t0}ms (${why})`);
         },
         () => {
-          void p.destroy().catch(() => undefined);
+          failedPoolCleanup = p.destroy().catch(() => undefined);
           if (pool === p) pool = null;
         }
       );
@@ -2830,7 +2915,7 @@ export class ReferenceResolver {
       const deferredCount = result.unresolved.length - failures.length;
       const failedCleanup = ReferenceResolver.partitionFailedCleanup(failures);
       for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
-        removedThisBatch += this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+        removedThisBatch += this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK), this.ueStaticProfile);
         await maybeYield();
       }
       for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
@@ -2928,28 +3013,44 @@ export class ReferenceResolver {
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
     // synthesize observer/callback dispatch edges (dispatcher → registered
-    // callbacks) that static parsing leaves out. Best-effort — never fail the
-    // index on it. The pool (when it survived resolution) is REUSED to fan the
+    // callbacks) that static parsing leaves out. UE profiles require this work
+    // to complete; other profiles retain best-effort behavior. The pool is REUSED to fan the
     // independent passes across its read-only workers — that's why its destroy
     // lives in the finally below, after synthesis, not at the end of the batch
     // loop. See docs/design/callback-edge-synthesis.md.
     const tSynth = Date.now();
+    if (synthesize && this.ueStaticProfile) this.queries.setMetadata('synthesis_pending', '1');
     try {
+      // A partially started pool cannot serve synthesis; wait for its cleanup
+      // and use the sequential path rather than racing its read connections.
+      if (synthesize && pool && !poolReady) {
+        const booting = pool;
+        try { await booting.ready(); poolReady = true; }
+        catch {
+          if (pool === booting) pool = null;
+          failedPoolCleanup = booting.destroy().catch(() => undefined);
+        }
+      }
+      if (synthesize && failedPoolCleanup) await failedPoolCleanup;
       if (synthesize) aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
         this.queries,
         this.context,
         onSynthesisProgress,
         pool,
         parallel?.backpressure,
-        buildDeferredIndexes
+        buildDeferredIndexes,
+        { requireAllPasses: this.ueStaticProfile }
       );
-    } catch {
+      if (synthesize && this.ueStaticProfile) this.queries.setMetadata('synthesis_pending', '0');
+    } catch (error) {
+      if (this.ueStaticProfile) throw error;
       // synthesis is additive and optional; ignore failures
     }
     buildDeferredIndexes();
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] callback-synthesis: ${Date.now() - tSynth}ms`);
     } finally {
       if (pool) await pool.destroy().catch(() => undefined);
+      if (failedPoolCleanup) await failedPoolCleanup;
     }
 
     if (loopProf) {
@@ -2975,7 +3076,8 @@ export class ReferenceResolver {
     const stage = new SynthesisStage(dbPath);
     try {
       const fresh = new ReferenceResolver(this.projectRoot, stage.queries);
-      const count = await synthesizeCallbackEdges(stage.queries, fresh.context, onProgress, null, backpressure);
+      const count = await synthesizeCallbackEdges(stage.queries, fresh.context, onProgress, null, backpressure,
+        undefined, { requireAllPasses: this.ueStaticProfile });
       await stage.publish(backpressure);
       return count;
     } finally {

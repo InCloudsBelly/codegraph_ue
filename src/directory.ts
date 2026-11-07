@@ -1092,7 +1092,44 @@ export function createDirectory(projectRoot: string): void {
 /**
  * Remove the .codegraph directory
  */
+export function assertDirectoryRemovalSafe(projectRoot: string): void {
+  const codegraphDir = getCodeGraphDir(projectRoot);
+  let directory: fs.Stats;
+  try { directory = fs.lstatSync(codegraphDir); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!directory.isDirectory() || directory.isSymbolicLink()) return;
+
+  // The lock database must never be unlinked: another process may hold its
+  // inode, even when the PID file is absent. Existence alone cannot establish
+  // that all users are gone, so fail before deleting any other graph data.
+  try {
+    fs.lstatSync(path.join(codegraphDir, 'codegraph.lock.lease'));
+    throw new Error('CodeGraph cleanup is unavailable while a write lease exists; preserve the graph until all connections can be verified closed.');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  // UE graphs can have long-lived readers without a writer lease. Until every
+  // reader participates in a cross-process lifecycle gate, their absence
+  // cannot be established safely and destructive cleanup must fail closed.
+  const configPath = path.join(codegraphDir, 'indexing.json');
+  try {
+    const stat = fs.lstatSync(configPath);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Cannot verify CodeGraph cleanup policy.');
+    const config: unknown = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Cannot verify CodeGraph cleanup policy.');
+    if (Object.prototype.hasOwnProperty.call(config, 'ueEngine')) {
+      throw new Error('UE CodeGraph cleanup is unavailable until all graph connections can be verified closed.');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
 export function removeDirectory(projectRoot: string): void {
+  assertDirectoryRemovalSafe(projectRoot);
   const codegraphDir = getCodeGraphDir(projectRoot);
 
   if (!fs.existsSync(codegraphDir)) {
@@ -1221,7 +1258,7 @@ export function ensureSubdirectory(projectRoot: string, subdirName: string): str
 /**
  * Check if the .codegraph directory has valid structure
  */
-export function validateDirectory(projectRoot: string): {
+export function validateDirectory(projectRoot: string, options: { readOnly?: boolean } = {}): {
   valid: boolean;
   errors: string[];
 } {
@@ -1237,6 +1274,8 @@ export function validateDirectory(projectRoot: string): {
     errors.push('.codegraph exists but is not a directory');
     return { valid: false, errors };
   }
+
+  if (options.readOnly) return { valid: true, errors };
 
   // Auto-repair / upgrade .gitignore (non-critical file). A missing one is
   // recreated; a stale pre-wildcard default that never ignored daemon.pid is

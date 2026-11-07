@@ -246,7 +246,7 @@ export class MCPEngine {
         this.cg = null;
       }
       assertNoRebuild(resolvedRoot);
-      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly });
+      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly, automaticOpen: 'query' });
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
@@ -281,7 +281,7 @@ export class MCPEngine {
     this.queryPool = null;
     const measurementsDown = endFreshnessMeasurements();
     const drained = this.toolHandler.closeAll();
-    this.stopPromise = Promise.all([drained, poolDown, measurementsDown]).then(async () => {
+    const stopping = Promise.all([drained, poolDown, measurementsDown]).then(async () => {
       if (this.initPromise) await this.initPromise;
       if (this.defaultLease) {
         await this.defaultLease.release();
@@ -296,14 +296,19 @@ export class MCPEngine {
       if (this.writerLockRoot) releaseWriterLock(this.writerLockRoot);
       this.writerLockRoot = null;
     });
+    this.stopPromise = stopping.catch(error => {
+      this.stopPromise = null;
+      throw error;
+    });
     return this.stopPromise;
   }
 
   private releaseExplicitProject(cg: CodeGraph): void | Promise<void> {
     const lease = this.explicitProjects.get(cg);
-    this.explicitProjects.delete(cg);
-    if (lease) return lease.release();
-    else cg.close();
+    if (lease) return lease.release().then(() => {
+      if (this.explicitProjects.get(cg) === lease) this.explicitProjects.delete(cg);
+    });
+    cg.close();
   }
 
   /** Watch options shared by the default project and explicit projects. */
@@ -374,7 +379,7 @@ export class MCPEngine {
     this.projectPath = resolvedRoot;
     try {
       assertNoRebuild(resolvedRoot);
-      const opened = await loadCodeGraph().open(resolvedRoot, { readOnly: this.opts.readOnly });
+      const opened = await loadCodeGraph().open(resolvedRoot, { readOnly: this.opts.readOnly, automaticOpen: 'query' });
       if (this.closed) { opened.close(); return; }
       this.cg = opened;
       this.toolHandler.setDefaultCodeGraph(this.cg);
@@ -406,7 +411,7 @@ export class MCPEngine {
    */
   private startWatching(): void {
     if (this.opts.readOnly || !this.cg || this.watcherStarted || !this.opts.watch) return;
-    if (this.cg.hasUeScopeProfile?.()) return;
+    if (this.cg.getExistingIndexProfile() !== 'generic') return;
 
     const opened = this.cg;
     opened.assertAutomaticSyncAllowed();
@@ -430,7 +435,7 @@ export class MCPEngine {
   private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
-    if (cg.hasUeScopeProfile?.()) return;
+    if (cg.getExistingIndexProfile() !== 'generic') return;
     // The lease's gate is the startup reconcile and stays settled once caught
     // up; a database reopened after a rebuild (#1902) needs a sync of its own.
     if (this.defaultLease && !afterReopen) {

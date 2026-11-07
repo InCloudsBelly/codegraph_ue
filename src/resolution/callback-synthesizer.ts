@@ -5186,14 +5186,15 @@ export async function synthesizeCallbackEdges(
   // A live resolver pool to fan the independent passes across (structural type
   // so this file never imports the pool — resolver-worker imports THIS file).
   // Null/omitted → the sequential path, byte-identical to the pool path.
-  pool?: { runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }>; readonly size?: number } | null,
+  pool?: { runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }>; abort?(error: Error): Promise<void>; readonly size?: number } | null,
   // WAL-valve writer backstop (WalCheckpointValve.backpressure), called at
   // pool-idle points in the edge-insert loops below — the passes themselves
   // only read; every write in this function happens with the pool idle.
   backpressure?: () => Promise<void> | null,
   // Main-thread work to run while the pool computes the passes (the main
   // thread otherwise only waits there) — e.g. building a deferred index.
-  whilePoolBusy?: () => void
+  whilePoolBusy?: () => void,
+  options: { requireAllPasses?: boolean } = {}
 ): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
@@ -5331,10 +5332,12 @@ export async function synthesizeCallbackEdges(
   // value loads feeds the JSX that names the value, even with no markup of its
   // own: a page given its default export, or a barrel rewired, redraws it. So
   // does every file a tag imported from the project is read through.
+  let stopped = false;
   const collectInputs = async (): Promise<string[]> => {
     const found = new Set<string>();
     const tagModules = new Map<string, Set<string>>();
     for (const file of ctx.getAllFiles()) {
+      if (stopped) break;
       const content = ctx.readFile(file);
       if (content !== null && hasSynthesisPattern(file, content)) {
         found.add(file);
@@ -5350,6 +5353,15 @@ export async function synthesizeCallbackEdges(
   let inputs: string[] | null = null;
 
   if (pool && gatedIn.length > 1) {
+    let abortPromise: Promise<void> | undefined;
+    const stop = (error: unknown): void => {
+      if (stopped) return;
+      stopped = true;
+      if (pool.abort) {
+        abortPromise = pool.abort(error instanceof Error ? error : new Error(String(error)));
+        void abortPromise.catch(() => undefined);
+      }
+    };
     const runPooled = async (i: number): Promise<void> => {
       const pass = SYNTH_PASSES[i]!;
       // This pass also records controlled build-metadata observations in the
@@ -5361,10 +5373,16 @@ export async function synthesizeCallbackEdges(
       }
       try {
         const out = await pool.runSynthPass(pass.name);
+        if (stopped) return;
         passEdges[i] = out.edges;
         markPass(pass.name, out.ms);
       } catch (err) {
+        // Cancellation must not turn into another main-thread fallback.
+        if (stopped) throw err;
         if (graphNodes > MAIN_RETRY_MAX_NODES) {
+          if (options.requireAllPasses) {
+            throw new Error(`[synthesis] required pass '${pass.name}' failed on a worker: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+          }
           // Worker died at a scale where the main-thread retry is a process
           // OOM risk: skip the pass, keep the index alive, and say so.
           console.error(
@@ -5388,15 +5406,36 @@ export async function synthesizeCallbackEdges(
       (a, b) => synthPassCostHint(SYNTH_PASSES[b]!.name) - synthPassCostHint(SYNTH_PASSES[a]!.name) || a - b
     );
     const lane = async (): Promise<void> => {
-      for (let i = queue.shift(); i !== undefined; i = queue.shift()) await runPooled(i);
+      try {
+        while (!stopped) {
+          const i = queue.shift();
+          if (i === undefined) return;
+          await runPooled(i);
+        }
+      } catch (error) {
+        stop(error);
+        throw error;
+      }
     };
-    const fanOut = Promise.all(Array.from({ length: lanes }, lane));
-    // Observed now, awaited below: a rejection while the scan runs must not
-    // surface as an unhandled one.
-    fanOut.catch(() => undefined);
-    whilePoolBusy?.();
-    inputs = await collectInputs();
-    await fanOut;
+    // A failed lane must not let the caller close the database while another
+    // lane is still running a main-thread fallback. Observe every lane even if
+    // a worker, the concurrent main-thread work, or the input scan fails.
+    const fanOut = Promise.allSettled(Array.from({ length: lanes }, lane));
+    let mainFailed = false;
+    let mainError: unknown;
+    try {
+      whilePoolBusy?.();
+      inputs = await collectInputs();
+    } catch (error) {
+      mainFailed = true;
+      mainError = error;
+      stop(error);
+    }
+    const results = await fanOut;
+    if (abortPromise) await abortPromise;
+    if (mainFailed) throw mainError;
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failed) throw failed.reason;
   } else {
     for (const i of gatedIn) {
       await runPassOnMain(i);

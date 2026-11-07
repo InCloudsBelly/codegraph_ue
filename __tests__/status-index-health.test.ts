@@ -22,7 +22,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 
-const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
+const BIN = path.join(process.env.CODEGRAPH_TEST_DIST ?? path.resolve(__dirname, '../dist'), 'bin/codegraph.js');
 
 function spawn(cwd: string, args: string[]) {
   return spawnSync(process.execPath, [BIN, ...args], {

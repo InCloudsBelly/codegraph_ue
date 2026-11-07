@@ -3,8 +3,9 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
 
-/** Bind an unfinished UE generation to the actual running extraction build. */
-export async function ueRuntimeBuildIdentity(runtimeRoot = path.resolve(__dirname, '..'), dependencyRoot?: string): Promise<string> {
+/** Keep exact recovery identity and completed-graph compatibility separate. */
+export async function ueRuntimeBuildIdentities(runtimeRoot = path.resolve(__dirname, '..'), dependencyRoot?: string):
+Promise<{ exact: string; semantics: string }> {
   const packageRoot = path.resolve(runtimeRoot, '..');
   const entries: Array<{ name: string; file: string }> = [];
   const walk = async (base: string, relative: string, prefix: string, source: boolean): Promise<void> => {
@@ -41,15 +42,28 @@ export async function ueRuntimeBuildIdentity(runtimeRoot = path.resolve(__dirnam
     if (!found) throw new Error(`Cannot identify UE runtime dependency: ${name}`);
     await walk(dir, '', `dependency/${name}`, false);
   }
-  const hash = createHash('sha256').update(`node=${process.version}\0platform=${process.platform}\0arch=${process.arch}\0`);
+  const runtime = `node=${process.version}\0platform=${process.platform}\0arch=${process.arch}\0`;
+  const exact = createHash('sha256').update(runtime);
+  const semantics = createHash('sha256').update(runtime).update('ue-index-semantics-v1\0');
   // Throughput-only worker counts and timeout limits do not change a
   // successfully completed graph and may vary with available system memory.
   const settings = ['CODEGRAPH_KERNEL', 'CODEGRAPH_KERNEL_CFNPTR', 'CODEGRAPH_KERNEL_LANGS', 'CODEGRAPH_KERNEL_PATH',
     'CODEGRAPH_VALUE_REFS', 'CODEGRAPH_AMBIGUOUS_NAME_CEILING', 'CODEGRAPH_NO_REBIND'];
-  for (const setting of settings) hash.update(`${setting}=${process.env[setting] ?? '<unset>'}\0`);
+  for (const setting of settings) {
+    const value = `${setting}=${process.env[setting] ?? '<unset>'}\0`;
+    exact.update(value);
+    semantics.update(value);
+  }
+  const presentation = /^runtime\/(?:bin\/(?:codegraph|ue-reconcile)|mcp\/(?:server-instructions|tools)|ui\/[^/]+)\.(?:js|ts)$/;
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const content = await fs.readFile(entry.file);
-    hash.update(`${entry.name}\0${content.length}\0`).update(content);
+    const label = `${entry.name}\0${content.length}\0`;
+    exact.update(label).update(content);
+    // These entrypoints and presentation modules consume the index or
+    // delegate to the SDK. Keep them in the exact publication/recovery identity.
+    if (!presentation.test(entry.name)) {
+      semantics.update(label).update(content);
+    }
   }
   const nativeCandidates: string[] = [];
   if (process.env.CODEGRAPH_KERNEL_PATH) {
@@ -66,11 +80,20 @@ export async function ueRuntimeBuildIdentity(runtimeRoot = path.resolve(__dirnam
   for (const [index, file] of nativeCandidates.entries()) {
     try {
       const content = await fs.readFile(file);
-      hash.update(`native/${index}\0${content.length}\0`).update(content);
+      const label = `native/${index}\0${content.length}\0`;
+      exact.update(label).update(content);
+      semantics.update(label).update(content);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      hash.update(`native/${index}\0missing\0`);
+      const missing = `native/${index}\0missing\0`;
+      exact.update(missing);
+      semantics.update(missing);
     }
   }
-  return hash.digest('hex');
+  return { exact: exact.digest('hex'), semantics: semantics.digest('hex') };
+}
+
+/** Bind an unfinished UE generation to the actual running extraction build. */
+export async function ueRuntimeBuildIdentity(runtimeRoot?: string, dependencyRoot?: string): Promise<string> {
+  return (await ueRuntimeBuildIdentities(runtimeRoot, dependencyRoot)).exact;
 }

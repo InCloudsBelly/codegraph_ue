@@ -1,4 +1,6 @@
 import { defineConfig } from 'vitest/config';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
 
 /**
@@ -8,6 +10,9 @@ import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
  * a browser test needs cannot leak into the other 200-odd suites.
  */
 export default defineConfig({
+  // The managed backend fingerprints node_modules; Vite's default cache there
+  // would invalidate its build receipt even when tests never rebuild dist.
+  cacheDir: path.join(os.tmpdir(), `codegraph-vitest-${process.pid}`),
   test: {
     globals: true,
     environment: 'node',

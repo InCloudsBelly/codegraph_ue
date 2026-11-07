@@ -57,8 +57,76 @@ function build(part: BuildPart, root: string): void {
   }
 }
 
+function samePath(left: string, right: string): boolean {
+  const a = path.resolve(left), b = path.resolve(right);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** A receipt may be temporarily absent while a registered backend is rebuilt. */
+function isManagedCheckout(root: string): boolean {
+  const repository = path.resolve(root, '..', '..', '..');
+  const registeredPath = path.join(repository, 'extensions', 'codegraph', 'codegraph_ue');
+  if (samePath(root, registeredPath)) {
+    try {
+      fs.lstatSync(path.join(repository, 'dependencies', 'locks', 'codegraph-ue.lock.yaml'));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  const receiptPath = path.resolve(root, '..', '.build', 'codegraph-ue.json');
+  try {
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8')) as { sourcePath?: unknown };
+    if (typeof receipt.sourcePath !== 'string' || !path.isAbsolute(receipt.sourcePath)) {
+      throw new Error('receipt has no absolute source path');
+    }
+    return samePath(receipt.sourcePath, root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw new Error(`[test setup] Cannot verify the managed runtime receipt: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** A disposable checkout must not write through links into another runtime. */
+function assertLocalTestOutput(root: string): void {
+  for (const relative of ['node_modules', 'ui', 'ui/node_modules']) {
+    const directory = path.join(root, relative);
+    try {
+      if (fs.lstatSync(directory).isSymbolicLink()) {
+        throw new Error(`[test setup] Refusing linked test output dependency: ${directory}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  const pending = [path.join(root, 'dist'), path.join(root, 'node_modules', '.vite'),
+    path.join(root, 'ui', 'node_modules', '.vite')];
+  while (pending.length) {
+    const file = pending.pop()!;
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(file); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || (stat.isFile() && stat.nlink > 1)) {
+      throw new Error(`[test setup] Refusing linked test output: ${file}`);
+    }
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(file)) pending.push(path.join(file, name));
+    } else if (!stat.isFile()) {
+      throw new Error(`[test setup] Refusing non-file test output: ${file}`);
+    }
+  }
+}
+
 /** Exported for isolated filesystem fixtures; Vitest calls the default wrapper. */
 export function ensureTestDist(root: string, runBuild: BuildRunner = build): void {
+  root = fs.realpathSync(root);
+  // Rebuilding from a test could replace files used by live MCP consumers.
+  if (isManagedCheckout(root)) {
+    throw new Error('[test setup] Refusing to rebuild a managed runtime; run tests in a disposable checkout instead.');
+  }
+  assertLocalTestOutput(root);
   for (const part of ['engine', 'viewer'] as const) {
     const stamp = path.join(root, 'dist', `.test-build-${part}.json`);
     const inputs = inputFingerprint(root, part);

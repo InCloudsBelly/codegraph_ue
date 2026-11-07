@@ -68,7 +68,7 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; ueCppDeclarations?: boolean }) => {
   if (msg.type === 'load-grammars') {
     // Grammar WASM bytes pre-read by the main thread (when provided) make this
     // a memory load instead of a per-spawn disk read — see issue #1231.
@@ -102,7 +102,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
               language
             ).some((fw) => !!fw.extract)
           : false;
-      if (!frameworksNeedDecode && !(language === 'cpp' && (mayDefineCppMacroMethods(content!) || mayHaveUnrealReflection(content!)))) {
+      if (!msg.ueCppDeclarations && !frameworksNeedDecode && !(language === 'cpp' && (mayDefineCppMacroMethods(content!) || mayHaveUnrealReflection(content!)))) {
         const raw = tryKernelExtractRaw(filePath!, content!, language);
         if (raw) {
           result = {
@@ -117,7 +117,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
           };
         }
       }
-      result ??= extractFromSource(filePath!, content!, language, frameworkNames);
+      result ??= extractFromSource(filePath!, content!, language, frameworkNames, msg.ueCppDeclarations);
 
       // Periodic parser reset to reclaim WASM heap memory
       const count = (parseCounts.get(language) ?? 0) + 1;

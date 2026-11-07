@@ -7,6 +7,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash, randomUUID } from 'node:crypto';
+import { AutomaticSyncError } from './ue-automatic-error';
 import {
   Node,
   NodeKind,
@@ -36,6 +38,7 @@ import {
   isInitialized,
   createDirectory,
   removeDirectory,
+  assertDirectoryRemovalSafe,
   validateDirectory,
   assertNoExistingIndexArtifacts,
   acquireIndexPublicationLease,
@@ -67,11 +70,10 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { inferUeModuleRelations, type UeModuleRelation } from './graph/ue-static-modules';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
-import { Mutex, FileLock } from './utils';
+import { Mutex, FileLock, FileLockBusyError } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 
-import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
@@ -81,9 +83,9 @@ import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 import { CPP_INCLUDE_SNAPSHOT_KEY, checkCppIncludeSnapshot } from './resolution/cpp-include-environment';
 import { ensureUeModuleGrammar } from './resolution/ue-module-environment';
-import { loadIndexingConfig, type UeEngineConfig } from './indexing-config';
-import { probeUeScopeInputs, ueScopeConfigSignature, type UePluginScope } from './extraction/ue-engine-scope';
-import { ueRuntimeBuildIdentity } from './extraction/ue-build-identity';
+import { getIndexingConfigStatus, loadIndexingConfig, type UeEngineConfig } from './indexing-config';
+import { probeUeScopeInputs, ueScopeConfigSignature, UeScopeObservationCache, type UePluginScope } from './extraction/ue-engine-scope';
+import { ueRuntimeBuildIdentities, ueRuntimeBuildIdentity } from './extraction/ue-build-identity';
 
 /** Explicit init may create a new project directory, but uncertain I/O is never absence. */
 function ensureInitializationRoot(projectRoot: string): void {
@@ -148,7 +150,13 @@ export interface OpenOptions {
 
   /** Whether to run in read-only mode */
   readOnly?: boolean;
+
+  /** @internal Start UE queries read-only. The UE-only entry also keeps other profiles read-only. */
+  automaticOpen?: 'ue' | 'query';
 }
+
+type ExistingIndexOptions = Pick<OpenOptions, 'readOnly' | 'automaticOpen'>;
+type ExistingIndexProfile = 'ue' | 'generic' | 'unverified';
 
 /**
  * Options for indexing
@@ -177,13 +185,16 @@ export interface IndexOptions {
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
 const UE_SCOPE_STATE_KEY = 'ue_engine_scope_applied_v1';
 const UE_SCOPE_PENDING_KEY = 'ue_engine_scope_pending_v1';
+const UE_CANDIDATE_TAIL_VERSION_KEY = 'ue_candidate_tail_version';
 
 interface UeScopeState {
   version: 1;
   depth: number;
   config: string;
   fingerprint: string;
+  layoutFingerprint?: string;
   probeFingerprint?: string;
+  generation?: string;
   unresolvedCount?: number;
   candidateCount?: number;
   incompleteFiles?: string[];
@@ -191,6 +202,7 @@ interface UeScopeState {
   knownPlugins?: readonly string[];
   discoverNew?: boolean;
   buildIdentity?: string;
+  semanticsIdentity?: string;
 }
 
 export interface UeScopeStatus {
@@ -207,6 +219,7 @@ export interface UeScopeStatus {
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
+  private ueReadSync?: Promise<SyncResult>;
   private projectRoot: string;
   // Assigned via wireLayers() from the constructor (and again on reopen) — the
   // `!` tells TS these are definitely set even though the assignment is one
@@ -222,6 +235,7 @@ export class CodeGraph {
 
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
+  private ueWorktreeBuildLock?: FileLock;
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
@@ -236,7 +250,9 @@ export class CodeGraph {
           !value.plugins.every(p => p && typeof p.root === 'string' && Number.isInteger(p.depth) && p.depth >= 0 && typeof p.manual === 'boolean') ||
           (value.knownPlugins !== undefined && (!Array.isArray(value.knownPlugins) || !value.knownPlugins.every(p => typeof p === 'string'))) ||
           (value.discoverNew !== undefined && typeof value.discoverNew !== 'boolean') ||
+          (value.layoutFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(value.layoutFingerprint)) ||
           (value.probeFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(value.probeFingerprint)) ||
+          (value.semanticsIdentity !== undefined && !/^[a-f0-9]{64}$/.test(value.semanticsIdentity)) ||
           (value.buildIdentity !== undefined && !/^[a-f0-9]{64}$/.test(value.buildIdentity)) ||
           (value.unresolvedCount !== undefined && (!Number.isInteger(value.unresolvedCount) || value.unresolvedCount < 0)) ||
           (value.candidateCount !== undefined && (!Number.isInteger(value.candidateCount) || value.candidateCount < 0)) ||
@@ -245,31 +261,75 @@ export class CodeGraph {
     } catch { throw new Error('UE scope state is invalid; preserve the index and recover it explicitly.'); }
   }
 
-  private async makeUeScope(config: UeEngineConfig, depth: number, knownPlugins?: readonly string[], discoverNew = true): Promise<UePluginScope> {
-    const scope = await buildUeScopeForProjectAsync(this.projectRoot, config, depth, { knownPlugins, discoverNew });
+  private async makeUeScope(config: UeEngineConfig, depth: number, knownPlugins?: readonly string[], discoverNew = true,
+    observationCache?: UeScopeObservationCache, options: Pick<IndexOptions, 'onProgress' | 'signal'> = {}): Promise<UePluginScope> {
+    const scope = await buildUeScopeForProjectAsync(this.projectRoot, config, depth, {
+      knownPlugins, discoverNew, observationCache, signal: options.signal,
+      onObserved: options.onProgress ? current => options.onProgress!({ phase: 'observing', current, total: 0 }) : undefined,
+    });
     this.orchestrator.setUeScope(scope);
     return scope;
   }
 
   private ueScopeSnapshot(scope: UePluginScope, probeFingerprint?: string, buildIdentity?: string): UeScopeState {
-    return { version: 1, depth: scope.depth, config: scope.configSignature, fingerprint: scope.fingerprint, plugins: scope.plugins,
+    return { version: 1, depth: scope.depth, config: scope.configSignature, fingerprint: scope.fingerprint, layoutFingerprint: scope.layoutFingerprint, plugins: scope.plugins,
       ...(buildIdentity ? { buildIdentity } : {}),
-      ...(probeFingerprint ? { probeFingerprint, unresolvedCount: scope.unresolved.length,
-        candidateCount: this.queries.getUeCandidateCount(), incompleteFiles: scope.incomplete } : {}),
+      ...(probeFingerprint ? { probeFingerprint, generation: randomUUID(), unresolvedCount: scope.unresolved.length,
+        incompleteFiles: scope.incomplete } : {}),
       ...(scope.observationOptions.knownPlugins ? { knownPlugins: scope.observationOptions.knownPlugins } : {}),
       ...(scope.observationOptions.discoverNew !== undefined ? { discoverNew: scope.observationOptions.discoverNew } : {}) };
   }
 
   private setUeScopePending(scope: UePluginScope, buildIdentity: string): void {
     this.queries.runInTransaction(() => {
+      this.db.getDb().exec(`CREATE TABLE IF NOT EXISTS ue_sync_change_journal (
+        file_path TEXT PRIMARY KEY, was_present INTEGER NOT NULL, previous_names TEXT NOT NULL
+      )`);
+      this.db.getDb().exec('CREATE TABLE IF NOT EXISTS ue_sync_retry_queue (row_id INTEGER PRIMARY KEY)');
+      this.queries.ensureUeDynamicCandidateIndex();
       this.queries.setMetadata(UE_SCOPE_PENDING_KEY, JSON.stringify(this.ueScopeSnapshot(scope, undefined, buildIdentity)));
       this.queries.setMetadata('index_state', 'partial');
     });
   }
 
+  /** Old and new names suffice to invalidate nonempty UE symbol candidates. */
+  private ueChangedCandidateNames(changedFiles: readonly string[]): string[] | undefined {
+    const maxFiles = 128, maxNames = 4096;
+    const journal = this.db.getDb().prepare(
+      'SELECT previous_names FROM ue_sync_change_journal ORDER BY file_path LIMIT ?'
+    ).all(maxFiles + 1) as Array<{ previous_names: string }>;
+    if (journal.length > maxFiles || changedFiles.length > maxFiles) return undefined;
+    const names = new Set<string>();
+    for (const entry of journal) {
+      const value: unknown = JSON.parse(entry.previous_names);
+      if (!Array.isArray(value) || !value.every(name => typeof name === 'string')) {
+        throw new Error('UE sync change journal is invalid; preserve the incomplete graph.');
+      }
+      for (const name of value as string[]) {
+        names.add(name);
+        if (names.size > maxNames) return undefined;
+      }
+    }
+    const current = this.queries.getUeNodeNamesByFilesBounded(changedFiles, maxNames + 1);
+    if (current.length > maxNames) return undefined;
+    for (const name of current) {
+      names.add(name);
+      if (names.size > maxNames) return undefined;
+    }
+    return [...names];
+  }
+
   private probeUeScope(config: UeEngineConfig, pluginRoots: readonly string[]): Promise<string> {
     return probeUeScopeInputs(this.projectRoot, config, pluginRoots, readUeExternalIgnoreRules(this.projectRoot),
       directory => readUeExternalIgnoreRules(path.join(this.projectRoot, directory), true));
+  }
+
+  private loadUeSourceObservations(config: UeEngineConfig): UeScopeObservationCache {
+    const signature = ueScopeConfigSignature(this.projectRoot, config);
+    const cache = new UeScopeObservationCache();
+    cache.bind(fs.realpathSync(this.projectRoot), signature);
+    this.queries.seedUeSourceObservations(signature, cache);
+    return cache;
   }
 
   private async verifyUeIndexedHashes(scope: UePluginScope): Promise<void> {
@@ -279,7 +339,7 @@ export class CodeGraph {
     // its original content has returned by the final scope observation.
     const expected = new Set((await scanDirectoryAsync(this.projectRoot, undefined, undefined, scope)).map(identity));
     const hashes = new Map([...scope.sourceHashes].map(([file, hash]) => [identity(file), hash]));
-    for (const file of this.queries.getAllFiles()) {
+    for (const file of this.queries.getAllFileHashes()) {
       const id = identity(file.path);
       if (!expected.delete(id) || hashes.get(id) !== file.contentHash) {
         throw new Error(`UE indexed source changed during verification: ${file.path}; the incomplete index was preserved for recovery.`);
@@ -288,13 +348,28 @@ export class CodeGraph {
     if (expected.size) throw new Error(`UE indexed source missing during verification: ${expected.values().next().value}; the incomplete index was preserved for recovery.`);
   }
 
-  private async finishUeScope(config: UeEngineConfig, scope: UePluginScope, buildIdentity: string, recoveringInitial = false): Promise<void> {
+  private async finishUeScope(config: UeEngineConfig, scope: UePluginScope, buildIdentity: string, stampBuildInfo = false,
+    candidateTailsComplete = false,
+    options: Pick<IndexOptions, 'onProgress' | 'signal'> & {
+      observations?: UeScopeObservationCache; independentVerification?: boolean;
+    } = {}): Promise<void> {
+    // Candidate validation and explicit recovery need an independent byte
+    // observation. An ordinary delta can reuse previously committed evidence
+    // for files whose precise stamps still match, and rereads every new observation.
+    const observations = stampBuildInfo || options.independentVerification
+      ? new UeScopeObservationCache() : options.observations ?? new UeScopeObservationCache();
+    observations.invalidateChanged();
+    options.signal?.throwIfAborted();
+    options.onProgress?.({ phase: 'verifying', current: 0, total: 0 });
     const roots = scope.plugins.map(plugin => plugin.root);
     const probeBefore = await this.probeUeScope(config, roots);
     // Re-run the same frozen generation: including freshly discovered plugins
     // as expansion roots here would silently advance another layer.
-    const verified = await buildUeScopeForProjectAsync(this.projectRoot, config, scope.depth, scope.observationOptions);
-    if (verified.fingerprint !== scope.fingerprint) throw new Error('UE scope inputs changed during indexing; the incomplete index was preserved for recovery.');
+    const verified = await buildUeScopeForProjectAsync(this.projectRoot, config, scope.depth, {
+      ...scope.observationOptions, observationCache: observations, signal: options.signal,
+      onObserved: options.onProgress ? current => options.onProgress!({ phase: 'verifying', current, total: 0 }) : undefined,
+    });
+    if (verified.fingerprint !== scope.fingerprint || verified.layoutFingerprint !== scope.layoutFingerprint) throw new Error('UE scope inputs changed during indexing; the incomplete index was preserved for recovery.');
     // An A -> B -> A edit can leave identical start/end observations but B in
     // the database. Check what was actually persisted, not just the endpoints.
     await this.verifyUeIndexedHashes(verified);
@@ -304,28 +379,38 @@ export class CodeGraph {
     }
     const probeAfter = await this.probeUeScope(config, roots);
     if (probeBefore !== probeAfter) throw new Error('UE scope inputs changed during final verification; the incomplete index was preserved for recovery.');
-    if (await ueRuntimeBuildIdentity() !== buildIdentity) throw new Error('UE runtime build changed during indexing; the incomplete index was preserved.');
+    const identity = await ueRuntimeBuildIdentities();
+    if (identity.exact !== buildIdentity) throw new Error('UE runtime build changed during indexing; the incomplete index was preserved.');
+    options.signal?.throwIfAborted();
     this.queries.runInTransaction(() => {
-      if (recoveringInitial) {
+      if (stampBuildInfo) {
         this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
         this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
       }
-      this.queries.setMetadata(UE_SCOPE_STATE_KEY, JSON.stringify(this.ueScopeSnapshot(scope, probeAfter, buildIdentity)));
+      if (candidateTailsComplete || stampBuildInfo) this.queries.setMetadata(UE_CANDIDATE_TAIL_VERSION_KEY, '1');
+      this.queries.saveUeSourceObservations(scope.configSignature, observations, verified.sourceHashes,
+        this.ueScopeState()?.layoutFingerprint !== verified.layoutFingerprint);
+      this.queries.setMetadata(UE_SCOPE_STATE_KEY, JSON.stringify({
+        ...this.ueScopeSnapshot(scope, probeAfter, buildIdentity), semanticsIdentity: identity.semantics,
+      }));
       this.queries.setMetadata(UE_SCOPE_PENDING_KEY, '');
       this.queries.setMetadata('index_state', 'complete');
+      this.db.getDb().exec('DROP TABLE IF EXISTS ue_sync_change_journal');
+      this.db.getDb().exec('DROP TABLE IF EXISTS ue_sync_retry_queue');
     });
   }
 
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    projectRoot: string
+    projectRoot: string,
+    private readonly openOptions: ExistingIndexOptions = {},
   ) {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
     this.fileLock = new FileLock(
-      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
+      path.join(path.dirname(db.getPath()), 'codegraph.lock')
     );
     this.wireLayers();
   }
@@ -426,18 +511,20 @@ export class CodeGraph {
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
     // handle stays in place and the caller retries on the next query, rather
     // than leaving this instance with no connection at all.
-    const fresh = DatabaseConnection.open(dbPath, { readOnly: this.db.readOnly });
-    const stale = this.db;
-    this.db = fresh;
-    this.queries = new QueryBuilder(fresh.getDb());
-    this.wireLayers();
+    const fresh = CodeGraph.openExistingDatabase(this.projectRoot, dbPath, this.openOptions);
+    this.useDatabase(fresh);
     // Whoever reopened — a sync, or a tool call's self-heal — the next sync
     // must reconcile the whole tree (#1902).
     this.pendingFullReconcile = true;
-    // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
-    // pinning the unlinked inode (#925).
-    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
     return true;
+  }
+
+  private useDatabase(fresh: DatabaseConnection): void {
+    const previous = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    try { previous.close(); } catch { /* the new connection is already active */ }
   }
 
   // ===========================================================================
@@ -516,29 +603,13 @@ export class CodeGraph {
     assertNoPendingIndexPublication(resolvedRoot);
     await initGrammars();
 
-    // Check if initialized
-    if (!isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
-    }
-
-    // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
-    if (!validation.valid) {
-      throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
-    }
-
-    // Open database
-    const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
-    try { assertNoPendingIndexPublication(resolvedRoot); } catch (error) { db.close(); throw error; }
-    const queries = new QueryBuilder(db.getDb());
-
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    const instance = CodeGraph.openSync(resolvedRoot, options);
 
     // Sync if requested
     if (options.sync && !options.readOnly) {
       try {
-        await instance.sync();
+        if (options.automaticOpen) await instance.syncAutomatically();
+        else await instance.sync();
       } catch (err) {
         instance.destroy();
         throw err;
@@ -562,7 +633,7 @@ export class CodeGraph {
   /**
    * Open synchronously (without sync)
    */
-  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> = {}): CodeGraph {
+  static openSync(projectRoot: string, options: ExistingIndexOptions = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
@@ -571,18 +642,35 @@ export class CodeGraph {
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(resolvedRoot, { readOnly: options.readOnly || !!options.automaticOpen });
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
-    try { assertNoPendingIndexPublication(resolvedRoot); } catch (error) { db.close(); throw error; }
-    const queries = new QueryBuilder(db.getDb());
+    const db = CodeGraph.openExistingDatabase(resolvedRoot, dbPath, options);
+    return new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot, { ...options });
+  }
 
-    return new CodeGraph(db, queries, resolvedRoot);
+  private static openExistingDatabase(projectRoot: string, dbPath: string, options: ExistingIndexOptions): DatabaseConnection {
+    assertNoPendingIndexPublication(projectRoot);
+    let db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly || !!options.automaticOpen });
+    try {
+      if (options.automaticOpen === 'query' && !options.readOnly &&
+          CodeGraph.readIndexProfile(projectRoot, db) === 'generic') {
+        assertNoPendingIndexPublication(projectRoot);
+        const validation = validateDirectory(projectRoot);
+        if (!validation.valid) throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
+        db.close();
+        db = DatabaseConnection.open(dbPath);
+      }
+      assertNoPendingIndexPublication(projectRoot);
+      return db;
+    } catch (error) {
+      db.close();
+      throw error;
+    }
   }
 
   /**
@@ -597,8 +685,9 @@ export class CodeGraph {
    */
   close(): void {
     this.unwatch();
-    // Release file lock if held
-    this.fileLock.release();
+    // A failed release retains ownership and the DB so close can be retried.
+    try { this.ueWorktreeBuildLock?.release(); }
+    finally { this.fileLock.release(); }
     this.db.close();
   }
 
@@ -618,13 +707,37 @@ export class CodeGraph {
    *
    * Uses a mutex to prevent concurrent indexing operations.
    */
+  private acquireUeWorktreeBuild(): FileLock {
+    const file = path.join(fs.realpathSync(this.projectRoot), '.codegraph-ue-build.lock');
+    for (const candidate of [file, file + '.lease']) {
+      if (fs.lstatSync(candidate, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        throw new Error('The UE worktree build lease cannot use a linked path.');
+      }
+    }
+    const lease = this.ueWorktreeBuildLock ??= new FileLock(file);
+    try { lease.acquire(); }
+    catch (error) {
+      const message = `Cannot start a UE build in this worktree: ${error instanceof Error ? error.message : String(error)}`;
+      if (error instanceof FileLockBusyError) throw new LockUnavailableError(message);
+      throw new Error(message, { cause: error });
+    }
+    return lease;
+  }
+
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       const startedAt = Date.now();
+      let indexLocked = false;
+      let worktreeBuild: FileLock | undefined;
       try {
         this.fileLock.acquire();
-      } catch {
-        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
+        indexLocked = true;
+        if (this.hasUeScopeProfile()) worktreeBuild = this.acquireUeWorktreeBuild();
+      } catch (error) {
+        if (indexLocked) this.fileLock.release();
+        const message = error instanceof Error ? error.message : String(error);
+        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0,
+          errors: [{ message: `Could not acquire file lock: ${message}`, severity: 'error' as const }], durationMs: 0 };
       }
       // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
       // default 1000-page interval re-writes hot pages into the main DB file
@@ -647,6 +760,7 @@ export class CodeGraph {
       let priorAutocheckpoint = 1000;
       // The fast-init parse lane may also defer auto-checkpointing.
       let restoreAutocheckpoint = false;
+      let observations: UeScopeObservationCache | undefined;
       try {
         const ueConfig = loadIndexingConfig(this.projectRoot).ueEngine;
         const existingUeScope = this.ueScopeState();
@@ -655,7 +769,9 @@ export class CodeGraph {
         }
         if (!ueConfig && existingUeScope) throw new Error('Removing a UE scope requires a separately validated candidate.');
         const ueBuildIdentity = ueConfig ? await ueRuntimeBuildIdentity() : undefined;
-        const ueScope = ueConfig ? await this.makeUeScope(ueConfig, existingUeScope?.depth ?? 1) : undefined;
+        if (ueConfig && !worktreeBuild) worktreeBuild = this.acquireUeWorktreeBuild();
+        if (ueConfig) observations = new UeScopeObservationCache();
+        const ueScope = ueConfig ? await this.makeUeScope(ueConfig, existingUeScope?.depth ?? 1, undefined, true, observations, options) : undefined;
         // Discovery must complete before even advisory metadata or journal/FTS
         // changes. Reuse this observation throughout the extraction phase.
         const preparedScan = await this.orchestrator.prepareScan(options.onProgress);
@@ -861,7 +977,7 @@ export class CodeGraph {
           if (!ueConfig) await this.stampCppIncludeSnapshot();
         }
 
-        if (result.success && result.filesIndexed > 0) {
+        if (!ueConfig && result.success && result.filesIndexed > 0) {
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
@@ -908,12 +1024,18 @@ export class CodeGraph {
 
         if (ueConfig && ueScope) {
           const accounted = result.filesIndexed + result.filesSkipped;
+          const pendingReferences = this.queries.getUnresolvedReferencesCount();
+          const pendingSynthesis = this.queries.getMetadata('synthesis_pending') === '1';
           if (!result.success || result.filesErrored > 0 ||
-              (result.filesDiscovered !== undefined && accounted < result.filesDiscovered)) {
+              (result.filesDiscovered !== undefined && accounted < result.filesDiscovered) || pendingReferences > 0 || pendingSynthesis) {
             result.success = false;
             this.queries.setMetadata('index_state', 'partial');
+            if (pendingReferences > 0 || pendingSynthesis) result.errors.push({
+              severity: 'error', code: 'ue_index_incomplete',
+              message: `UE index has ${pendingReferences} pending references${pendingSynthesis ? ' and unfinished synthesis' : ''}; preserve it for recovery.`,
+            });
           } else {
-            await this.finishUeScope(ueConfig, ueScope, ueBuildIdentity!);
+            await this.finishUeScope(ueConfig, ueScope, ueBuildIdentity!, true, true, { ...options, observations });
           }
         }
 
@@ -940,7 +1062,9 @@ export class CodeGraph {
             this.db.getDb().pragma('journal_mode = WAL');
           } catch { /* connection may be closing */ }
         }
-        this.fileLock.release();
+        observations?.clear();
+        try { worktreeBuild?.release(); }
+        finally { this.fileLock.release(); }
       }
     });
   }
@@ -1014,22 +1138,105 @@ export class CodeGraph {
     return this.syncWithPolicy(options, true);
   }
 
+  /** Select failed UE refs onto disk before resolving, preserving row order with bounded JS batches. */
+  private async retryUeFailedReferences(result: SyncResult, options: IndexOptions, backpressure?: () => Promise<void> | null): Promise<number> {
+    const changed = result.changedFilePaths ?? [];
+    const addedFiles = new Set(result.addedFilePaths ?? []);
+    const couldName = this.resolver.couldNameAnyOf([...addedFiles]);
+    const resolvesToAdded = (specifier: string, fromFile: string, language: Language): boolean => {
+      const file = this.resolver.resolveModuleFile(specifier, fromFile, language);
+      return file !== null && addedFiles.has(file);
+    };
+    this.queries.clearUeRetryQueue();
+    let steps = 0;
+    const yieldPeriodically = async (): Promise<void> => {
+      if (++steps % 25 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+    };
+    const names = new Set([...this.queries.getNodeNamesByFiles(changed), ...changed.flatMap(moduleReferenceKeys)]);
+    for (const name of names) {
+      // The generic retry intentionally skips popular names. A UE graph must
+      // not mark itself fresh with an entire affected name left untouched;
+      // queue every matching C/C++ row in bounded pages instead.
+      let after = 0;
+      for (;;) {
+        const page = this.queries.getUeFailedReferencesAfterTail(name, after, 500);
+        if (!page.length) break;
+        after = page[page.length - 1]!.rowId!;
+        this.queries.enqueueUeRetryReferences(page);
+        await yieldPeriodically();
+      }
+      this.queries.enqueueUeRetryReferences(this.queries.getRetryableFailedReferences([name]));
+      await yieldPeriodically();
+    }
+    for (const key of new Set([...addedFiles].flatMap(importPathKeys))) {
+      this.queries.enqueueUeRetryReferences(this.queries.getRetryableFailedImports([key], [], undefined, [], undefined, couldName));
+      await yieldPeriodically();
+    }
+    for (const name of this.queries.getNodeNamesByFiles(changed, ['namespace', 'module'])) {
+      this.queries.enqueueUeRetryReferences(this.queries.getRetryableFailedImports([], [name], undefined, [], undefined, couldName));
+      await yieldPeriodically();
+    }
+    if (addedFiles.size) {
+      let afterName = '';
+      for (;;) {
+        const page = this.queries.getFailedScopedImportsAfter(afterName, 500);
+        if (!page.length) break;
+        afterName = page[page.length - 1]!.name;
+        for (const entry of page) if (resolvesToAdded(entry.name, entry.filePath, entry.language)) {
+          this.queries.enqueueUeRetryReferences(this.queries.getRetryableFailedImports([], [], undefined, [entry.name], undefined, couldName));
+        }
+        await yieldPeriodically();
+      }
+      let afterFolder = 0;
+      for (;;) {
+        const page = this.queries.getFailedFolderImportsAfter(afterFolder, 500);
+        if (!page.length) break;
+        afterFolder = page[page.length - 1]!.rowId!;
+        this.queries.enqueueUeRetryReferences(page.filter(ref => ref.filePath !== undefined && ref.language !== undefined &&
+          resolvesToAdded(ref.referenceName, ref.filePath, ref.language)));
+        await yieldPeriodically();
+      }
+    }
+    const total = this.queries.getUeRetryCount();
+    if (total) options.onProgress?.({ phase: 'resolving', current: 0, total });
+    let current = 0;
+    for (const prerequisites of [true, false]) {
+      let after = 0;
+      for (;;) {
+        const batch = this.queries.getUeRetryReferencesAfter(after, 500, prerequisites);
+        if (!batch.length) break;
+        after = batch[batch.length - 1]!.rowId!;
+        await this.resolver.resolveAndPersistListYielding(batch);
+        current += batch.length;
+        options.onProgress?.({ phase: 'resolving', current, total });
+        const pause = backpressure?.();
+        if (pause) await pause;
+      }
+    }
+    return current;
+  }
+
   private async syncWithPolicy(options: IndexOptions, automatic: boolean): Promise<SyncResult> {
     assertNoPendingIndexPublication(this.projectRoot);
     return this.indexMutex.withLock(async () => {
+      options.signal?.throwIfAborted();
       assertNoPendingIndexPublication(this.projectRoot);
       if (automatic) this.assertAutomaticSyncAllowed();
       const startedAt = Date.now();
       try {
         this.fileLock.acquire();
-      } catch (err) {
-        throw new LockUnavailableError(
-          `Sync could not acquire the file lock; retry when the index is available. ${err instanceof Error ? err.message : String(err)}`
-        );
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (error instanceof FileLockBusyError) {
+          throw new LockUnavailableError(`Sync could not acquire the file lock; retry when the index is available. ${detail}`);
+        }
+        throw new AutomaticSyncError('index-lock-error', `Sync could not acquire the file lock: ${detail}`);
       }
       let deferWal = false;
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
+      let observations: UeScopeObservationCache | undefined;
+      let worktreeBuild: FileLock | undefined;
       try {
         if (automatic) this.assertAutomaticSyncAllowed();
         let preparedBeforeReopen: PreparedFileScan | undefined;
@@ -1087,22 +1294,30 @@ export class CodeGraph {
         const ueConfig = loadIndexingConfig(this.projectRoot).ueEngine;
         const ueApplied = this.ueScopeState();
         const uePending = this.ueScopeState(UE_SCOPE_PENDING_KEY);
-        let ueBuildIdentity = ueConfig ? await ueRuntimeBuildIdentity() : undefined;
-        if (ueApplied && (!ueApplied.buildIdentity || ueApplied.buildIdentity !== ueBuildIdentity)) {
-          throw new Error('UE index was built by a different or unverified runtime; preserve it and validate a separate candidate.');
+        const identity = ueConfig ? await ueRuntimeBuildIdentities() : undefined;
+        let ueBuildIdentity = identity?.exact;
+        if (ueApplied && (!identity || (ueApplied.semanticsIdentity
+          ? ueApplied.semanticsIdentity !== identity.semantics : ueApplied.buildIdentity !== identity.exact))) {
+          throw new AutomaticSyncError('rebuild-required', 'UE index was built by a different or unverified runtime; preserve it and validate a separate candidate.');
         }
         if (uePending && (!uePending.buildIdentity || uePending.buildIdentity !== ueBuildIdentity)) {
           throw new Error('UE scope recovery requires the exact recorded runtime build identity; preserve this candidate.');
         }
         let ueScope: UePluginScope | undefined;
+        let ueLayoutUnchanged = false;
+        const requestedPaths = options.paths;
         let ueRecomputeCandidates = false;
         let ueRecoveringInitial = false;
         if (!ueConfig && (ueApplied || uePending)) throw new Error('Removing a UE scope requires a separately validated candidate.');
-        if (ueConfig && !ueApplied && !uePending) throw new Error('Applying a UE scope to an existing index requires a separately validated candidate.');
+        if (ueConfig && !ueApplied && !uePending) {
+          throw new AutomaticSyncError('rebuild-required', 'Applying a UE scope to an existing index requires a separately validated candidate.');
+        }
         if (ueConfig && !ueApplied && uePending) {
           if (automatic) throw new Error('An interrupted initial UE candidate requires explicit recovery.');
           if (uePending.config !== ueScopeConfigSignature(this.projectRoot, ueConfig)) throw new Error('UE scope configuration changed during initial recovery; preserve the candidate.');
-          ueScope = await this.makeUeScope(ueConfig, uePending.depth, uePending.knownPlugins, uePending.discoverNew ?? true);
+          worktreeBuild = this.acquireUeWorktreeBuild();
+          observations = this.loadUeSourceObservations(ueConfig);
+          ueScope = await this.makeUeScope(ueConfig, uePending.depth, uePending.knownPlugins, uePending.discoverNew ?? true, observations, options);
           if (ueScope.fingerprint !== uePending.fingerprint) throw new Error('UE source scope changed since the interrupted initial candidate; preserve it and build a new candidate.');
           ueRecoveringInitial = true;
           ueRecomputeCandidates = true;
@@ -1116,33 +1331,49 @@ export class CodeGraph {
           if (!uePending && !options.expandUePlugins && this.getIndexState() === 'complete' && ueApplied.config === configSignature && ueApplied.probeFingerprint &&
               this.queries.getMetadata('synthesis_pending') !== '1' && this.queries.getUnresolvedReferencesCount() === 0) {
             observedProbe = await this.probeUeScope(ueConfig, known);
+            options.signal?.throwIfAborted();
             if (observedProbe === ueApplied.probeFingerprint) {
               return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: Date.now() - startedAt };
             }
           }
-          const previous = await this.makeUeScope(ueConfig, ueApplied.depth, known, false);
-          // The scope fingerprint covers the admitted source bytes, paths,
-          // selected plugins and catalog. Avoid a second synchronous full scan.
-          const changed = previous.fingerprint !== ueApplied.fingerprint || ueApplied.config !== configSignature;
-          ueRecomputeCandidates = changed || !!uePending || !!options.expandUePlugins;
-          const depth = uePending?.depth ?? Math.min(ueConfig.maxDepth, ueApplied.depth + (changed || options.expandUePlugins ? 1 : 0));
-          const rootsForObservation = uePending?.knownPlugins ?? known;
-          ueScope = await this.makeUeScope(ueConfig, depth, rootsForObservation, uePending?.discoverNew ?? (changed || !!options.expandUePlugins));
-          const selected = new Set(ueScope.plugins.map(plugin => plugin.root.toLowerCase()));
-          if (ueScope.incomplete.length && ueApplied.plugins.some(plugin => !selected.has(plugin.root.toLowerCase()))) {
-            throw new Error('UE scope observation is incomplete; retaining previously indexed plugins.');
+          if (automatic && this.db.readOnly && this.openOptions.automaticOpen && !this.openOptions.readOnly) {
+            // The unchanged path above can stay read-only. SQLite can repair
+            // derived tables on writable open, so recheck under the writer lease.
+            options.signal?.throwIfAborted();
+            this.assertAutomaticSyncAllowed();
+            this.useDatabase(DatabaseConnection.open(this.db.getPath()));
           }
-          const scopeChanged = changed || uePending || ueApplied.config !== configSignature ||
-            JSON.stringify(ueApplied.plugins) !== JSON.stringify(ueScope.plugins);
-          if (scopeChanged) options = { ...options, paths: undefined };
+          observations = this.loadUeSourceObservations(ueConfig);
+          const previous = await this.makeUeScope(ueConfig, ueApplied.depth, known, false, observations, options);
+          // Reuse only sources whose recorded identities still match. A pure
+          // timestamp change needs verification, but no second scope build.
+          const changed = previous.fingerprint !== ueApplied.fingerprint || ueApplied.config !== configSignature;
           if (!changed && !options.expandUePlugins && !uePending && observedProbe &&
               this.queries.getMetadata('synthesis_pending') !== '1' && this.queries.getUnresolvedReferencesCount() === 0) {
             await this.verifyUeIndexedHashes(previous);
             const confirmedProbe = await this.probeUeScope(ueConfig, known);
+            options.signal?.throwIfAborted();
             if (confirmedProbe !== observedProbe) throw new Error('UE scope inputs changed during verification; retry the scope update.');
-            this.queries.setMetadata(UE_SCOPE_STATE_KEY, JSON.stringify({ ...ueApplied, probeFingerprint: confirmedProbe }));
+            this.queries.runInTransaction(() => {
+              this.queries.saveUeSourceObservations(configSignature, observations!, previous.sourceHashes, false);
+              this.queries.setMetadata(UE_SCOPE_STATE_KEY, JSON.stringify({ ...ueApplied, probeFingerprint: confirmedProbe,
+                layoutFingerprint: previous.layoutFingerprint }));
+            });
             return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: Date.now() - startedAt };
           }
+          ueRecomputeCandidates = changed || !!uePending || !!options.expandUePlugins;
+          const depth = uePending?.depth ?? Math.min(ueConfig.maxDepth, ueApplied.depth + (changed || options.expandUePlugins ? 1 : 0));
+          const rootsForObservation = uePending?.knownPlugins ?? known;
+          ueScope = await this.makeUeScope(ueConfig, depth, rootsForObservation,
+            uePending?.discoverNew ?? (changed || !!options.expandUePlugins), observations, options);
+          const selected = new Set(ueScope.plugins.map(plugin => plugin.root.toLowerCase()));
+          const explicitlyExcluded = ueScope.explicitlyExcluded;
+          if (ueScope.incomplete.length && ueApplied.plugins.some(plugin =>
+            !selected.has(plugin.root.toLowerCase()) && !explicitlyExcluded.has(plugin.root.toLowerCase()))) {
+            throw new Error('UE scope observation is incomplete; retaining previously indexed plugins.');
+          }
+          ueLayoutUnchanged = !uePending && !preparedBeforeReopen && ueApplied.layoutFingerprint === ueScope.layoutFingerprint;
+          options = { ...options, paths: undefined };
         }
         // Resolve every scope expansion before preparing the single observation
         // used for reconciliation. No freshness/journal writes precede it.
@@ -1156,7 +1387,7 @@ export class CodeGraph {
           // every indexed file whose observed content differs from the DB.
           const identity = (file: string): string => process.platform === 'win32' ? file.toLowerCase() : file;
           const observed = new Map([...ueScope.sourceHashes].map(([file, hash]) => [identity(file), { file, hash }]));
-          for (const file of this.queries.getAllFiles()) {
+          for (const file of this.queries.getAllFileHashes()) {
             const current = observed.get(identity(file.path));
             if (current && current.hash !== file.contentHash) {
               forceContentCheck.add(file.path);
@@ -1164,13 +1395,22 @@ export class CodeGraph {
             }
           }
         }
+        if (ueLayoutUnchanged && forceContentCheck.size) {
+          // Hints order the verified delta; they do not exclude external edits.
+          const hinted = (requestedPaths ?? []).map(file => file.replace(/\\/g, '/')).filter(file => forceContentCheck.has(file));
+          options = { ...options, paths: [...new Set([...hinted, ...forceContentCheck])] };
+        }
         if (forceContentCheck.size && options.paths) options = { ...options, paths: [...new Set([...options.paths, ...forceContentCheck])] };
+        const localImportFiles = ueLayoutUnchanged && options.paths?.length &&
+          options.paths.every(file => /\.(?:c|cc|cpp|cxx)$/i.test(file) && this.queries.hasFileNode(file))
+          ? new Set(options.paths) : undefined;
         const fullReconcile = !options.paths || options.paths.length === 0;
         // A pre-reopen observer cannot know the replacement DB's applied UE
         // generation; never reuse its default-depth scan for scoped deletion.
         const preparedScan = ueConfig
           ? await this.orchestrator.prepareScan(options.onProgress, options.paths)
           : preparedBeforeReopen ?? await this.orchestrator.prepareScan(options.onProgress, options.paths);
+        options.signal?.throwIfAborted();
         if (ueConfig && ueScope) {
           ueBuildIdentity ??= await ueRuntimeBuildIdentity();
           this.setUeScopePending(ueScope, ueBuildIdentity);
@@ -1232,6 +1472,13 @@ export class CodeGraph {
         let routesBefore = null as Node[] | null;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            if (ueConfig) {
+              const previous = this.queries.getFileByPath(filePath);
+              const names = previous ? this.queries.getNodeNamesByFiles([filePath]) : [];
+              this.db.getDb().prepare(
+                'INSERT OR IGNORE INTO ue_sync_change_journal (file_path, was_present, previous_names) VALUES (?, ?, ?)'
+              ).run(filePath, previous ? 1 : 0, JSON.stringify(names));
+            }
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
@@ -1240,6 +1487,31 @@ export class CodeGraph {
               this.queries.setMetadata('synthesis_pending', '1');
             }
           }, forceContentCheck.size ? forceContentCheck : undefined, preparedScan);
+
+        options.signal?.throwIfAborted();
+        // Journal entries from an earlier interrupted run need retry, but only
+        // files extracted by this run are safe to exclude from edge replay.
+        const freshlyExtractedPaths = result.changedFilePaths ?? [];
+        let replayedUeChanges = false;
+        if (ueConfig && uePending) {
+          const journal = this.db.getDb().prepare(
+            'SELECT file_path, was_present, previous_names FROM ue_sync_change_journal ORDER BY file_path'
+          ).all() as Array<{ file_path: string; was_present: number; previous_names: string }>;
+          const present = journal.filter(entry => this.queries.getFileByPath(entry.file_path) !== null);
+          const removed = journal.filter(entry => entry.was_present && !this.queries.getFileByPath(entry.file_path));
+          const names = journal.flatMap(entry => {
+            const value: unknown = JSON.parse(entry.previous_names);
+            if (!Array.isArray(value) || !value.every(name => typeof name === 'string')) {
+              throw new Error('UE sync change journal is invalid; preserve the incomplete graph.');
+            }
+            return value as string[];
+          });
+          result.changedFilePaths = [...new Set([...(result.changedFilePaths ?? []), ...present.map(entry => entry.file_path)])];
+          result.addedFilePaths = [...new Set([...(result.addedFilePaths ?? []), ...present.filter(entry => !entry.was_present).map(entry => entry.file_path)])];
+          result.removedFilePaths = [...new Set([...(result.removedFilePaths ?? []), ...removed.map(entry => entry.file_path)])];
+          result.definitionDelta = [...new Set([...(result.definitionDelta ?? []), ...names, ...this.queries.getNodeNamesByFiles(result.changedFilePaths)])];
+          replayedUeChanges = journal.length > 0;
+        }
 
         // A component a tag in an unchanged file may render: `<Team />` links
         // to the `Team` this sync adds. The gate above reads each changed file
@@ -1271,11 +1543,22 @@ export class CodeGraph {
         // name caches, which a long-lived daemon warmed against the
         // pre-removal graph.)
         if (ueRecoveringInitial) this.resolver.initialize();
-        if (ueRecoveringInitial || result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+        if (ueRecoveringInitial || replayedUeChanges || result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
         }
         if (ueConfig && (ueRecomputeCandidates || result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0)) {
-          await this.resolver.refreshUeIncludeCandidates();
+          // An unchanged layout and surviving file nodes preserve include
+          // targets. A header/scope change or recovery still refreshes globally.
+          const files = result.changedFilePaths ?? [];
+          const names = !uePending && !ueRecoveringInitial && this.queries.getMetadata(UE_CANDIDATE_TAIL_VERSION_KEY) === '1'
+            ? this.ueChangedCandidateNames(files) : undefined;
+          const imports = names !== undefined && localImportFiles &&
+            !result.filesAdded && !result.filesRemoved &&
+            [...localImportFiles].every(file => this.queries.hasFileNode(file)) &&
+            files.every(file => localImportFiles.has(file)) ? files : undefined;
+          await this.resolver.refreshUeIncludeCandidates(names, checked => {
+            options.onProgress?.({ phase: 'refreshing', current: checked, total: 0 });
+          }, imports);
         }
 
         // A route that appeared, went away or was renamed changes what a
@@ -1302,7 +1585,7 @@ export class CodeGraph {
         }
 
         // Resolve references if files were updated
-        const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        const filesChanged = replayedUeChanges || result.filesAdded > 0 || result.filesModified > 0;
         // The last edge before the failed-ref retry below: the rebind's
         // per-name ceiling counts only edges up to it (see
         // resurrectStaleResolutionEdges).
@@ -1312,24 +1595,36 @@ export class CodeGraph {
         const edgesBeforeResolution = this.queries.getMaxEdgeId();
         if (filesChanged) {
           if (result.changedFilePaths) {
-            // Scope resolution to changed files (git fast path — bounded set)
+            // Resolve changed files in bounded pages. A single changed-file
+            // batch can contain millions of references, even when the number
+            // of paths is small. Persist prerequisites before dependent calls.
             const tRefLoad = Date.now();
-            const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
-            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-ref-load: ${Date.now() - tRefLoad}ms (${unresolvedRefs.length} refs)`);
-
+            const changedPaths = [...new Set(result.changedFilePaths)];
+            const pathChunks: string[][] = [];
+            for (let at = 0; at < changedPaths.length; at += 400) pathChunks.push(changedPaths.slice(at, at + 400));
+            const totalRefs = pathChunks.reduce((sum, paths) => sum + this.queries.getPendingReferenceCountByFiles(paths), 0);
+            let resolvedRefs = 0;
             options.onProgress?.({
               phase: 'resolving',
               current: 0,
-              total: unresolvedRefs.length,
+              total: totalRefs,
             });
-
-            this.resolver.resolveAndPersist(unresolvedRefs, (current, total) => {
-              options.onProgress?.({
-                phase: 'resolving',
-                current,
-                total,
-              });
-            });
+            for (const prerequisites of [true, false]) {
+              for (const paths of pathChunks) {
+                let after = 0;
+                for (;;) {
+                  const batch = this.queries.getPendingReferencesByFilesAfter(paths, after, 500, prerequisites);
+                  if (!batch.length) break;
+                  after = batch[batch.length - 1]!.rowId!;
+                  await this.resolver.resolveAndPersistListYielding(batch);
+                  resolvedRefs += batch.length;
+                  options.onProgress?.({ phase: 'resolving', current: resolvedRefs, total: totalRefs });
+                  const pause = backpressure?.();
+                  if (pause) await pause;
+                }
+              }
+            }
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-ref-load: ${Date.now() - tRefLoad}ms (${resolvedRefs} refs)`);
 
             // Retry previously-failed refs the changed files may now satisfy
             // (#1240). Scoped resolution above only re-resolves refs FROM the
@@ -1354,6 +1649,10 @@ export class CodeGraph {
             // this is a few indexed lookups.
             const tRetry = Date.now();
             edgesBeforeRetry = this.queries.getMaxEdgeId();
+            if (ueConfig) {
+              const count = await this.retryUeFailedReferences(result, options, backpressure);
+              if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${count} refs)`);
+            } else {
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
               ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
               ...result.changedFilePaths.flatMap(moduleReferenceKeys),
@@ -1419,6 +1718,7 @@ export class CodeGraph {
               });
             }
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${retryable.length} refs)`);
+            }
 
             // A module that appeared, such as a package `__init__.py` or an
             // `index.ts` re-exporting what it imports: what the files importing
@@ -1552,13 +1852,13 @@ export class CodeGraph {
           const ambiguous = uePending
             ? this.queries.getAllAmbiguousUeTargetNames()
             : this.resolver.getAmbiguousUeTargetNames(result.definitionDelta ?? []);
-          await this.orchestrator.resurrectUeAmbiguousEdges(ambiguous, result.changedFilePaths ?? []);
+          await this.orchestrator.resurrectUeAmbiguousEdges(ambiguous, freshlyExtractedPaths);
         }
         if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
           const tRebind = Date.now();
           const rebound = this.orchestrator.resurrectStaleResolutionEdges(
             result.definitionDelta,
-            result.changedFilePaths ?? [],
+            freshlyExtractedPaths,
             edgesBeforeRetry
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
@@ -1790,7 +2090,8 @@ export class CodeGraph {
           if (this.queries.getUnresolvedReferencesCount() > 0 || this.queries.getMetadata('synthesis_pending') === '1') {
             throw new Error('UE scope recovery has unfinished references or synthesis; the incomplete index was preserved.');
           }
-          await this.finishUeScope(ueConfig, ueScope, ueBuildIdentity!, ueRecoveringInitial);
+          await this.finishUeScope(ueConfig, ueScope, ueBuildIdentity!, ueRecoveringInitial, false,
+            { ...options, observations, independentVerification: !!uePending });
         }
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
@@ -1798,6 +2099,7 @@ export class CodeGraph {
         result.durationMs = Date.now() - startedAt;
         return result;
       } finally {
+        observations?.clear();
         // Mirror indexAll's teardown: stop the valve, then restore the
         // auto-checkpoint interval (runMaintenance above already folded the
         // WAL on the success path; on the error path SQLite replays it on
@@ -1806,7 +2108,8 @@ export class CodeGraph {
         if (deferWal) {
           try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
         }
-        this.fileLock.release();
+        try { worktreeBuild?.release(); }
+        finally { this.fileLock.release(); }
       }
     });
   }
@@ -1847,23 +2150,31 @@ export class CodeGraph {
     }
   }
 
-  /** @internal Automatic owners must never turn partial or empty graph data into a full bake. */
-  assertAutomaticSyncAllowed(): void {
-    assertNoPendingIndexPublication(this.projectRoot);
-    if (this.db.isReplacedOnDisk()) {
-      throw new Error('Automatic sync is refused after database replacement; explicitly verify or recover the active index.');
-    }
-    if (this.getIndexState() !== 'complete') {
-      throw new Error('Automatic sync is refused for an incomplete index; explicitly recover it or validate an independent candidate.');
-    }
-    if (this.getIndexBuildInfo().extractionVersion !== EXTRACTION_VERSION) {
-      throw new Error('Automatic sync is refused for an incompatible extraction version; explicitly validate an independent candidate.');
-    }
+  /** @internal Readiness for automatic callers does not need graph statistics. */
+  hasConsistentIndexData(): boolean {
     const present = this.db.getDb().prepare(
       'SELECT EXISTS(SELECT 1 FROM files) AS files, EXISTS(SELECT 1 FROM nodes) AS nodes'
     ).get() as { files: number; nodes: number };
-    if (present.files !== present.nodes) {
-      throw new Error('Automatic sync is refused because file tracking and node data disagree; explicitly recover the existing graph.');
+    return present.files === present.nodes;
+  }
+
+  /** @internal Automatic owners must never turn partial or empty graph data into a full bake. */
+  assertAutomaticSyncAllowed(): void {
+    assertNoPendingIndexPublication(this.projectRoot);
+    if (this.db.isReplacedOnDisk() || getDatabasePath(this.projectRoot) !== this.db.getPath()) {
+      throw new AutomaticSyncError('index-replaced', 'Automatic sync is refused after database replacement; explicitly verify or recover the active index.');
+    }
+    const state = this.getIndexState();
+    if (state !== 'complete' || this.queries.getMetadata(UE_SCOPE_PENDING_KEY)) {
+      throw new AutomaticSyncError(state === 'indexing' ? 'project-busy' : 'index-incomplete',
+        'Automatic sync is refused for an incomplete index; explicitly recover it or validate an independent candidate.');
+    }
+    if (this.getIndexBuildInfo().extractionVersion !== EXTRACTION_VERSION) {
+      throw new AutomaticSyncError('rebuild-required', 'Automatic sync is refused for an incompatible extraction version; explicitly validate an independent candidate.');
+    }
+    if (!this.hasConsistentIndexData()) {
+      throw new AutomaticSyncError('index-data-inconsistent',
+        'Automatic sync is refused because file tracking and node data disagree; explicitly recover the existing graph.');
     }
   }
 
@@ -1979,27 +2290,68 @@ export class CodeGraph {
 
   /** Freshness of the applied source-scope generation, distinct from coverage. */
   hasUeScopeProfile(): boolean {
-    if (this.queries.getMetadata(UE_SCOPE_STATE_KEY) || this.queries.getMetadata(UE_SCOPE_PENDING_KEY)) return true;
-    try { return !!loadIndexingConfig(this.projectRoot).ueEngine; }
-    catch { return false; } // existing UE generations were already detected above
+    return this.getExistingIndexProfile() === 'ue';
   }
 
-  async getUeScopeStatus(): Promise<UeScopeStatus | null> {
+  /** @internal Determine the active profile without migrating or repairing the index. */
+  getExistingIndexProfile(): ExistingIndexProfile {
+    return CodeGraph.readIndexProfile(this.projectRoot, this.db, this.queries);
+  }
+
+  private static readIndexProfile(projectRoot: string, db: DatabaseConnection,
+    queries = new QueryBuilder(db.getDb())): ExistingIndexProfile {
+    const hasMetadata = !!db.getDb().prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'project_metadata'",
+    ).get();
+    if (hasMetadata && (queries.getMetadata(UE_SCOPE_STATE_KEY) || queries.getMetadata(UE_SCOPE_PENDING_KEY))) return 'ue';
+    const config = getIndexingConfigStatus(projectRoot);
+    if (config.ueEngine) return 'ue';
+    // Schema v1 predates project_metadata. Preserve its ordinary migration path.
+    if (config.error || (!hasMetadata && db.getSchemaVersion()?.version !== 1)) return 'unverified';
+    return 'generic';
+  }
+
+  /** @internal Share only an in-flight reconcile. Each answer validates its own read window. */
+  async reconcileUeRead(options: Pick<IndexOptions, 'onProgress' | 'signal'> = {}): Promise<SyncResult> {
+    if (options.onProgress || options.signal) return this.syncAutomatically(options);
+    const pending = this.ueReadSync ?? this.syncAutomatically();
+    this.ueReadSync = pending;
+    try { return await pending; }
+    finally { if (this.ueReadSync === pending) this.ueReadSync = undefined; }
+  }
+
+  /** @internal Opaque token for the committed generation and its verified source observation. */
+  getUeReadRevision(): string | null {
+    assertNoPendingIndexPublication(this.projectRoot);
+    if (this.db.isReplacedOnDisk() || this.getIndexState() !== 'complete' ||
+        this.queries.getMetadata(UE_SCOPE_PENDING_KEY)) return null;
+    const applied = this.queries.getMetadata(UE_SCOPE_STATE_KEY);
+    return applied ? createHash('sha256').update(applied).digest('hex') : null;
+  }
+
+  async getUeScopeStatus({ includeCoverage = true } = {}): Promise<UeScopeStatus | null> {
     try {
+      assertNoPendingIndexPublication(this.projectRoot);
       const config = loadIndexingConfig(this.projectRoot).ueEngine;
       const applied = this.ueScopeState();
       const pending = this.ueScopeState(UE_SCOPE_PENDING_KEY);
       if (!config && !applied && !pending) return null;
       const base: UeScopeStatus = { state: 'stale', depth: applied?.depth ?? null, maxDepth: config?.maxDepth ?? null,
-        plugins: applied?.plugins ?? [], unresolvedCount: applied?.candidateCount ?? 0,
+        plugins: applied?.plugins ?? [],
+        unresolvedCount: includeCoverage && applied ? applied.candidateCount ?? this.queries.getUeCandidateCount() : 0,
         outsidePluginCandidates: applied?.unresolvedCount ?? 0, incompleteFiles: applied?.incompleteFiles ?? [] };
       if (pending) return { ...base, reason: 'scope-update-pending' };
       if (!config || !applied) return { ...base, reason: 'scope-migration-required' };
       if (ueScopeConfigSignature(this.projectRoot, config) !== applied.config) return { ...base, reason: 'scope-config-changed' };
       if (this.getIndexState() !== 'complete') return { ...base, reason: 'index-incomplete' };
-      const currentBuild = await ueRuntimeBuildIdentity();
-      if (!applied.buildIdentity || applied.buildIdentity !== currentBuild) return { ...base, reason: 'runtime-build-changed' };
-      const stillCurrent = (): boolean => !this.ueScopeState(UE_SCOPE_PENDING_KEY) && this.getIndexState() === 'complete' &&
+      if (this.queries.getMetadata('synthesis_pending') === '1') return { ...base, reason: 'synthesis-pending' };
+      if (this.queries.getUnresolvedReferencesCount() > 0) return { ...base, reason: 'references-pending' };
+      const currentBuild = await ueRuntimeBuildIdentities();
+      if (applied.semanticsIdentity ? applied.semanticsIdentity !== currentBuild.semantics : applied.buildIdentity !== currentBuild.exact) {
+        return { ...base, reason: 'runtime-build-changed' };
+      }
+      const stillCurrent = (): boolean => !this.db.isReplacedOnDisk() && !this.ueScopeState(UE_SCOPE_PENDING_KEY) && this.getIndexState() === 'complete' &&
+        this.queries.getMetadata('synthesis_pending') !== '1' && this.queries.getUnresolvedReferencesCount() === 0 &&
         JSON.stringify(this.ueScopeState()) === JSON.stringify(applied) && ueScopeConfigSignature(this.projectRoot, config) === applied.config;
       if (applied.probeFingerprint) {
         const probe = await this.probeUeScope(config, applied.plugins.map(plugin => plugin.root));
@@ -2010,7 +2362,7 @@ export class CodeGraph {
       const scope = await buildUeScopeForProjectAsync(this.projectRoot, config, applied.depth, { knownPlugins: applied.plugins.map(plugin => plugin.root), discoverNew: false });
       if (!stillCurrent()) return { ...base, reason: 'scope-state-changed-during-check' };
       const changed = scope.fingerprint !== applied.fingerprint;
-      return { ...base, state: changed ? 'stale' : 'fresh', unresolvedCount: this.queries.getUeCandidateCount(), outsidePluginCandidates: scope.unresolved.length,
+      return { ...base, state: changed ? 'stale' : 'fresh', outsidePluginCandidates: scope.unresolved.length,
         incompleteFiles: scope.incomplete, ...(changed ? { reason: 'source-or-plugin-input-changed' } : {}) };
     } catch (error) {
       return { state: 'unknown', depth: null, maxDepth: null, plugins: [], unresolvedCount: 0, outsidePluginCandidates: 0, incompleteFiles: [],
@@ -2463,6 +2815,11 @@ export class CodeGraph {
    * it for every line it draws. See
    * {@link QueryBuilder.getUnresolvedReferencesInFile}.
    */
+  /** @internal Only candidate sites needed to render a UE query. */
+  getUeCandidatesInFile(file: string, limit: number): UnresolvedReference[] {
+    return this.queries.getUeCandidatesInFile(file, limit);
+  }
+
   getUnresolvedReferencesInFile(filePath: string, limit?: number): UnresolvedReference[] {
     return this.queries.getUnresolvedReferencesInFile(filePath, limit);
   }
@@ -2820,9 +3177,9 @@ export class CodeGraph {
   }
 
   /**
-   * Indexed files whose symbols are missing although their content is current
-   * — rows a content-hash comparison calls up to date (#2336). Reported by
-   * `status`; `sync` repairs the `needsReindex` group.
+   * Indexed files whose symbols are missing or potentially incomplete even
+   * though their content is current. Reported by `status`; `sync` repairs
+   * the `needsReindex` group.
    */
   getIndexHealth(): IndexHealth {
     const needsReindex: string[] = [];
@@ -2838,9 +3195,9 @@ export class CodeGraph {
         // languages and files over the size limit, which are empty on purpose.
         if (isFileLevelOnlyLanguage(file.language)) continue;
         if (errors.length === 0) needsReindex.push(file.path);
-        else if (errors.some((e) => e.severity === 'error' || e.code === 'parse_error')) parseErrors.push(file.path);
-      } else if (errors.some((e) => e.code === 'parse_error')) {
-        // Parsed, but the tree had errors and no symbols survived.
+        else if (errors.some((e) => e.severity === 'error' || e.code === 'parse_error' || e.code === 'partial_parse')) parseErrors.push(file.path);
+      } else if (errors.some((e) => e.code === 'parse_error' || e.code === 'partial_parse')) {
+        // An error or partial recovery can leave missing symbols and relations.
         parseErrors.push(file.path);
       }
     }
@@ -3158,6 +3515,10 @@ export class CodeGraph {
    * WARNING: This permanently deletes all CodeGraph data for the project.
    */
   uninitialize(): void {
+    if (this.hasUeScopeProfile()) {
+      throw new Error('UE CodeGraph cleanup is unavailable until all graph connections can be verified closed.');
+    }
+    assertDirectoryRemovalSafe(this.projectRoot);
     this.close();
     removeDirectory(this.projectRoot);
   }

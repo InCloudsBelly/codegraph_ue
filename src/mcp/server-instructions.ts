@@ -9,7 +9,7 @@
  * Goals when editing this:
  *   - Lead the agent to codegraph_explore for any structural/flow question
  *   - Reinforce "explore instead of Read/Grep" for indexed code
- *   - Anti-patterns (don't re-verify with grep; don't hand-reconstruct flows)
+ *   - Guidance for checking uncertain relationships against source
  *
  * Keep it tight. The agent reads this every session — long instructions
  * burn tokens. The DEFAULT MCP surface is `codegraph_explore` ALONE (see
@@ -28,8 +28,8 @@ Ordinary preflight does not expand an unchanged scope. On an explicit request
 to update and advance UE plugin dependencies, use the documented
 \`codegraph sync --expand-ue-plugins\` command; do not rebuild an existing index.
 
-Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
-the workspace — pre-computed structure you would otherwise re-derive by
+Codegraph is a SQLite knowledge graph of indexed symbols, edges, and files in
+the configured workspace scope — pre-computed structure you would otherwise re-derive by
 reading files (cached intelligence: thousands of parse/trace decisions you
 don't pay to re-reason each run). It indexes 30+ languages
 (TypeScript/JavaScript, Python, Go, Rust, Java, C#, C/C++, PHP, Ruby, Swift,
@@ -40,7 +40,7 @@ verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
 round-trips than reading files yourself.
 
-## One tool: codegraph_explore — use it instead of reading files
+## One tool: codegraph_explore
 
 There is a single tool, \`codegraph_explore\`, and it is Read-equivalent. It
 takes either a natural-language question or a bag of symbol/file names and
@@ -72,20 +72,20 @@ calls; a grep/read exploration is dozens.
 
 ## Anti-patterns
 
-- **Trust codegraph's results — don't re-verify them with grep.** They come from a full AST parse; re-checking with grep is slower, less accurate, and wastes context.
+- **Treat returned current source as already read, but verify uncertain relationships.** Parsing and cross-file resolution can be incomplete; a missing symbol or edge does not prove absence in the source.
 - **Don't grep or Read first** to find or understand indexed code — ONE \`codegraph_explore\` returns the relevant symbols' source together in a single round-trip. Reach for raw \`Read\`/\`Grep\` only to confirm a specific detail codegraph didn't cover, or for what codegraph doesn't index (configs, docs).
-- **Don't reconstruct a flow by hand** — name the endpoints in one \`codegraph_explore\` and it surfaces the path between them, dynamic-dispatch hops included.
-- **After editing, check the staleness banner.** When a tool response starts with "⚠️ Some files referenced below were edited since the last index sync…", the listed files are pending re-index — Read those specific files for accurate content. Every file NOT in that banner is fresh, so still trust codegraph. A different, rarer banner — "⚠️ CodeGraph auto-sync is DISABLED…" or "⚠️ CodeGraph auto-sync is RECOVERING…" — means the whole index may be stale; until the full catch-up completes, Read files directly to confirm anything that may have changed. If a response refuses to answer from changed files or says freshness could not be verified within its budget, retry after sync or narrow the query; that refusal is not an error in the tool.
+- **Check important flows against source when needed.** Naming endpoints in \`codegraph_explore\` can reveal paths and possible dynamic-dispatch hops; an absent hop does not prove that no path exists.
+- **After editing, check the staleness and coverage notices.** Read or retry the affected files when the index is stale or parsing failed. A fresh index can still have missing symbols or uncertain relationships; verify relevant source when coverage is incomplete.
 - **A file flagged "⚠ changed on disk after the last index sync" drifted from its index** (most common on projects queried via \`projectPath\`, which have no live watcher). Codegraph never serves a possibly-mis-sliced body from such a file — it either shows the file's full CURRENT source (trust it as a Read) or omits the source with this flag. When the source was omitted, Read that specific file; line numbers referencing it elsewhere in the response may be shifted until that project's next sync. All unflagged files remain trustworthy.
 
 - **Source is re-served on every call by default**, including for fresh subagents and after context compaction. Cross-call dedup requires \`CODEGRAPH_EXPLORE_DEDUP=1\` and is only suitable for hosts that guarantee one durable context per connection. With that opt-in, **"Already sent earlier in this conversation"** points to exact, unchanged source returned by an earlier \`codegraph_explore\` in that context. Use that copy; don't re-fetch it and don't Read the file. The bytes it freed went into source you have not seen yet, elsewhere in the same response.
 
 ## Limitations
 
-- In this Unreal fork, reflection annotations are indexed as declarations, not UHT output. Explicit native delegate bindings may add heuristic flow hops with their registration sites; dynamic names, lambdas and uncertain receiver aliases are not inferred. A missing hop does not prove a callback cannot run. An unobserved or incomplete C++ include environment cannot certify a fresh graph, even when a file watcher is healthy.
+- In this Unreal fork, reflection annotations are indexed as declarations, not UHT output. Explicit native delegate bindings may add heuristic flow hops with their registration sites; dynamic names, lambdas and uncertain receiver aliases are not inferred. A missing hop does not prove a callback cannot run. For a UE profile, freshness describes the indexed scope and is separate from incomplete static include or parse coverage; check source when a relationship is uncertain. Other C/C++ profiles may require a verified include environment to establish freshness.
 
 - If a tool reports a project isn't indexed (no \`.codegraph/\`), stop calling codegraph tools for that project for the rest of the session and use your built-in tools there instead. Indexing is the user's decision — mention they can run \`codegraph init\` if it comes up, but don't run it yourself.
-- Index lags file writes by ~1 second.
+- Watcher timing varies. UE profile queries reconcile and verify the indexed generation as part of the same call. Use one targeted query. If it reports that synchronization or freshness verification failed, read the source directly.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
 `;

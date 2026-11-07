@@ -53,8 +53,13 @@ if (parentPort) {
   let handler: InstanceType<typeof import('./tools').ToolHandler> | null = null;
   let initError: string | null = null;
   try {
-    const cg = root ? loadCodeGraph().openSync(root) : null;
+    const cg = root ? loadCodeGraph().openSync(root, { readOnly: true }) : null;
     handler = new (loadToolHandler())(cg);
+    handler.setProjectLifecycle({
+      open: projectRoot => loadCodeGraph().openSync(projectRoot, { readOnly: true }),
+      activate: async () => {},
+      release: project => project.close(),
+    });
   } catch (err) {
     initError = err instanceof Error ? err.message : String(err);
   }

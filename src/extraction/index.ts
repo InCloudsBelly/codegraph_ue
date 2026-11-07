@@ -28,7 +28,7 @@ import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLangu
 import { loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { loadUeAwareExtensionOverrides as loadExtensionOverrides } from './ue-source-extensions';
 import { getIndexingConfigPath, loadIndexingConfig, type UeEngineConfig } from '../indexing-config';
-import { assertUnlinkedUePath, buildUeEngineScope, buildUeEngineScopeAsync, type UePluginScope } from './ue-engine-scope';
+import { assertUnlinkedUePath, buildUeEngineScope, buildUeEngineScopeAsync, type UePluginScope, type UeScopeObservationCache } from './ue-engine-scope';
 import { ueTestOnlyLines } from './ue-test-scope';
 import { GitIgnoredPaths } from './git-ignored-paths';
 import { isCodeGraphDataDir } from '../directory';
@@ -125,7 +125,7 @@ const WORKER_RECYCLE_INTERVAL = 250;
  * Progress callback for indexing operations
  */
 export interface IndexProgress {
-  phase: 'scanning' | 'parsing' | 'storing' | 'resolving' | 'linking';
+  phase: 'observing' | 'scanning' | 'parsing' | 'storing' | 'resolving' | 'linking' | 'refreshing' | 'verifying';
   current: number;
   total: number;
   currentFile?: string;
@@ -1670,7 +1670,8 @@ export function buildUeScopeForProject(
 /** Cooperative scope observation for indexing and preflight. */
 export async function buildUeScopeForProjectAsync(
   rootDir: string, config: UeEngineConfig, depth = 1,
-  options: { knownPlugins?: readonly string[]; discoverNew?: boolean } = {},
+  options: { knownPlugins?: readonly string[]; discoverNew?: boolean; observationCache?: UeScopeObservationCache;
+    onObserved?: (count: number) => void; signal?: AbortSignal } = {},
 ): Promise<UePluginScope> {
   const admit = await ueScopeAdmissionAsync(rootDir, config);
   await new Promise<void>(resolve => setImmediate(resolve));
@@ -2681,8 +2682,9 @@ export class ExtractionOrchestrator {
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides, this.rootDir);
       const names = this.frameworksForFile(filePath, frameworkNames);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
-      return pool.requestParse({ filePath, content, language, frameworkNames: names });
+      const ueCppDeclarations = !!this.ueScope && (language === 'cpp' || language === 'c');
+      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names, ueCppDeclarations));
+      return pool.requestParse({ filePath, content, language, frameworkNames: names, ueCppDeclarations });
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---
@@ -3318,7 +3320,8 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
-    const result = this.filterUeTestResult(relativePath, content, language, extractFromSource(relativePath, content, language, frameworkNames));
+    const ueCppDeclarations = !!this.ueScope && (language === 'cpp' || language === 'c');
+    const result = this.filterUeTestResult(relativePath, content, language, extractFromSource(relativePath, content, language, frameworkNames, ueCppDeclarations));
 
     // Store in database
     await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
@@ -3988,7 +3991,7 @@ export class ExtractionOrchestrator {
       // in this loop and take the resurrected rows with them.)
       // Every name this file defined is about to stop existing here, which
       // narrows the candidate set for that name repo-wide (CG-33).
-      for (const pair of this.queries.getNodeNamePairsByFiles([tracked.path])) pairsBefore.add(pair);
+      for (const pair of this.queries.getNodeDefinitionFingerprintsByFiles([tracked.path])) pairsBefore.add(pair);
       const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
       if (incoming.length > 0) {
         const resurrected = incoming
@@ -4103,7 +4106,7 @@ export class ExtractionOrchestrator {
     // before inserting the new ones, so this is the last point the pre-edit
     // definition set is readable (CG-33).
     if (filesToIndex.length > 0) {
-      for (const pair of this.queries.getNodeNamePairsByFiles(filesToIndex)) pairsBefore.add(pair);
+      for (const pair of this.queries.getNodeDefinitionFingerprintsByFiles(filesToIndex)) pairsBefore.add(pair);
     }
 
     // Load only grammars needed for changed files
@@ -4131,21 +4134,12 @@ export class ExtractionOrchestrator {
       if (pause) await pause;
     }
 
-    // Names whose definition set this sync changed: a `file\0name` pair present
-    // before but not after (removed/renamed away) or after but not before
-    // (added). A pair on both sides is untouched as far as resolution's
-    // candidate set is concerned — only its node id moved, which
-    // reattachCrossFileEdges already follows — so an edit that only changes
-    // bodies yields an empty delta and no downstream rebind work (CG-33).
-    //
-    // Compared per FILE, not as one name set over the whole batch: a commit
-    // that adds `collect` to a new file while an unrelated changed file already
-    // defined `collect` must still flag the name, and a bare name set cancels
-    // exactly that case out. That miss left the largest residual class in the
-    // first measurement of this fix.
-    const pairsAfter = this.queries.getNodeNamePairsByFiles(filesToIndex);
+    // Compare stable per-file definition identities, including qualified name,
+    // signature and multiplicity. A body-only edit does not invalidate callers,
+    // but a new same-named definition in the same file must do so.
+    const pairsAfter = this.queries.getNodeDefinitionFingerprintsByFiles(filesToIndex);
     const deltaNames = new Set<string>();
-    const nameOf = (pair: string) => pair.slice(pair.indexOf('\0') + 1);
+    const nameOf = (pair: string): string => (JSON.parse(pair) as string[])[1]!;
     for (const pair of pairsBefore) if (!pairsAfter.has(pair)) deltaNames.add(nameOf(pair));
     for (const pair of pairsAfter) if (!pairsBefore.has(pair)) deltaNames.add(nameOf(pair));
     const definitionDelta = [...deltaNames];

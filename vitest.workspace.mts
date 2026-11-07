@@ -1,5 +1,7 @@
 import { svelte, vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import { defineWorkspace } from 'vitest/config';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 /**
  * Two projects, one command (`npm test` still runs everything).
@@ -39,6 +41,7 @@ export default defineWorkspace([
     // suites a second time inside jsdom (and two of them fail there, for
     // reasons that have nothing to do with anything). This project stands
     // alone, and it needs none of the base's spawn-related env anyway.
+    cacheDir: path.join(os.tmpdir(), `codegraph-vitest-ui-${process.pid}`),
     plugins: [
       // The same preprocessor `ui/svelte.config.js` builds with, so the test
       // compiles what the package ships.

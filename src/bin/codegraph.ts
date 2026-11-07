@@ -96,6 +96,29 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
   }
 }
 
+/** Raw CLI reads must not bypass the UE profile's use-before-read reconcile. */
+async function openForRead(projectPath: string): Promise<import('../index').default> {
+  const { default: CodeGraph } = await loadCodeGraph();
+  const cg = await CodeGraph.open(projectPath, { automaticOpen: 'query' });
+  try {
+    const profile = cg.getExistingIndexProfile();
+    if (profile === 'unverified') {
+      throw new Error('Cannot verify the active index profile. Check indexing configuration or inspect source directly.');
+    }
+    if (profile === 'ue') {
+      await cg.syncAutomatically();
+      const scope = await cg.getUeScopeStatus();
+      if (!scope || scope.state !== 'fresh') {
+        throw new Error(`Cannot verify a fresh UE scope (${scope?.reason ?? 'unknown'}); inspect source directly.`);
+      }
+    }
+    return cg;
+  } catch (error) {
+    cg.destroy();
+    throw error;
+  }
+}
+
 // Dynamic import helper — tsc compiles import() to require() in CJS mode,
 // which fails for ESM-only packages. This bypasses the transformation.
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
@@ -343,9 +366,10 @@ function createVerboseProgress(): (progress: { phase: string; current: number; t
         console.log(`[${elapsed}s]   ${progress.current}/${progress.total} (${pct}%)${progress.currentFile ? ` ${getGlyphs().dash} ${progress.currentFile}` : ''}`);
       }
     } else if (progress.current > 0) {
-      // Scanning phase (no total yet) — log periodically
+      // A scan or candidate refresh can report a count before its total is known.
       if (progress.current % 1000 === 0 || progress.current === 1) {
-        console.log(`[${elapsed}s]   ${formatNumber(progress.current)} files found`);
+        const unit = progress.phase === 'refreshing' ? 'references checked' : 'files found';
+        console.log(`[${elapsed}s]   ${formatNumber(progress.current)} ${unit}`);
       }
     }
   };
@@ -1061,11 +1085,9 @@ program
   });
 
 /**
- * The `status` warnings for indexed files whose symbols are missing although
- * their content is current (#2335, #2336): one line per group, saying what is
- * wrong, what to do, and naming up to three of the files.
+ * Describe missing or partially parsed symbols even when content is current.
  */
-function describeFilesMissingSymbols(health: { needsReindex: string[]; parseErrors: string[] }): string[] {
+function describeFilesMissingSymbols(health: { needsReindex: string[]; parseErrors: string[] }, ueProfile = false): string[] {
   const dash = getGlyphs().dash;
   const sample = (paths: string[]): string =>
     paths.slice(0, 3).join(', ') + (paths.length > 3 ? ` (+${formatNumber(paths.length - 3)} more)` : '');
@@ -1079,10 +1101,15 @@ function describeFilesMissingSymbols(health: { needsReindex: string[]; parseErro
   }
   const unparsed = health.parseErrors.length;
   if (unparsed > 0) {
-    lines.push(
-      `${formatNumber(unparsed)} ${unparsed === 1 ? 'file could not be parsed, so its symbols are' : 'files could not be parsed, so their symbols are'} ` +
-      `missing: ${sample(health.parseErrors)} ${dash} "codegraph files --json" shows the errors`
-    );
+    if (ueProfile) {
+      lines.push(`${formatNumber(unparsed)} ${unparsed === 1 ? 'file has' : 'files have'} parse errors; symbols and relationships may be incomplete: ` +
+        `${sample(health.parseErrors)} ${dash} "codegraph files --json" shows the errors`);
+    } else {
+      lines.push(
+        `${formatNumber(unparsed)} ${unparsed === 1 ? 'file could not be parsed, so its symbols are' : 'files could not be parsed, so their symbols are'} ` +
+        `missing: ${sample(health.parseErrors)} ${dash} "codegraph files --json" shows the errors`
+      );
+    }
   }
   return lines;
 }
@@ -1126,8 +1153,12 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath, options.metadataOnly ? { readOnly: true, sync: false } : {});
-      const stats = cg.getStats();
+      const cg = await CodeGraph.open(projectPath, options.metadataOnly ? { readOnly: true } : { automaticOpen: 'query' });
+      const stats = options.metadataOnly ? null : cg.getStats();
+      const dataConsistent = options.metadataOnly ? cg.hasConsistentIndexData() : undefined;
+      // An invalid config or metadata-only request does not erase the stored
+      // UE profile or make generic destructive recovery advice appropriate.
+      const ueProfile = cg.hasUeScopeProfile();
       const ueScope = options.metadataOnly || indexingConfig.error ? null : await cg.getUeScopeStatus();
       // Invalid scope configuration must remain diagnosable without scanning it.
       const changes = options.metadataOnly || indexingConfig.error ? null : ueScope
@@ -1141,7 +1172,8 @@ program
       const storedIndexState = cg.getIndexState();
       // Existing consumers understand partial; never let an old adapter call
       // a stale/unknown UE generation fresh because it ignores ueScope.
-      const indexState = ueScope && ueScope.state !== 'fresh' && storedIndexState === 'complete' ? 'partial' : storedIndexState;
+      const indexState = storedIndexState === 'complete' && (dataConsistent === false || (ueScope && ueScope.state !== 'fresh'))
+        ? 'partial' : storedIndexState;
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
       const pendingRefs = cg.getPendingReferenceCount();
@@ -1167,6 +1199,7 @@ program
           projectPath,
           indexPath: getCodeGraphDir(projectPath),
           indexingConfig,
+          ueProfile,
           ...(ueScope ? { ueScope } : {}),
           ...(options.metadataOnly ? { workingTreeChecked: false, freshness: 'unknown' } : {}),
           // The UE profile reports its static scope instead of claiming to have
@@ -1174,15 +1207,17 @@ program
           // treat this optional field as absent and honor index.state.
           ...(ueScope ? {} : { cppIncludeEnvironment }),
           lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
-          fileCount: stats.fileCount,
-          nodeCount: stats.nodeCount,
-          edgeCount: stats.edgeCount,
-          dbSizeBytes: stats.dbSizeBytes,
-          walSizeBytes: stats.walSizeBytes,
+          ...(stats ? {
+            fileCount: stats.fileCount,
+            nodeCount: stats.nodeCount,
+            edgeCount: stats.edgeCount,
+            dbSizeBytes: stats.dbSizeBytes,
+            walSizeBytes: stats.walSizeBytes,
+            nodesByKind: stats.nodesByKind,
+            languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
+          } : { dataConsistent }),
           backend,
           journalMode,
-          nodesByKind: stats.nodesByKind,
-          languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
           pendingChanges: changes ? {
             added: changes.added.length,
             modified: changes.modified.length,
@@ -1200,6 +1235,7 @@ program
             // (a run was killed mid-index — the index is truncated) |
             // 'failed' | null (predates the marker).
             state: indexState,
+            storedState: storedIndexState,
             // References awaiting resolution. Non-zero at rest means an
             // interrupted resolution pass left edges missing; the next
             // sync sweeps them (#1187).
@@ -1207,8 +1243,8 @@ program
             // Files stored without their symbols (e.g. while their grammar
             // could not load, #2335); the next sync re-indexes them.
             filesNeedingReindex: health?.needsReindex.length ?? null,
-            // Files with a recorded parse error and no symbols from it
-            // (#2336); unchanged until the file or the parser changes.
+            // Files with a recorded parse failure or partial parse; some
+            // symbols may still be present in partially parsed files.
             filesWithParseErrors: health?.parseErrors.length ?? null,
           },
         }));
@@ -1227,7 +1263,9 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
-      if (indexState === 'indexing') {
+      if (ueProfile && (indexState === 'indexing' || indexState === 'partial' || indexState === 'failed')) {
+        warn(`UE index is incomplete or its freshness is unverified${ueScope?.reason ? ` (${ueScope.reason})` : ''} — preserve the existing data and investigate before running "codegraph sync".`);
+      } else if (indexState === 'indexing') {
         warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
       } else if (indexState === 'partial') {
         warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
@@ -1238,6 +1276,12 @@ program
         warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
       }
       console.log();
+
+      if (!stats) {
+        info('Working tree was not checked; run "codegraph status" for a strict status.');
+        cg.destroy();
+        return;
+      }
 
       // Index stats
       console.log(chalk.bold('Index Statistics:'));
@@ -1309,7 +1353,7 @@ program
         }
         info('Run "codegraph sync" to update the index');
       }
-      const missingSymbols = health ? describeFilesMissingSymbols(health) : [];
+      const missingSymbols = health ? describeFilesMissingSymbols(health, ueProfile) : [];
       for (const line of missingSymbols) warn(line);
       const cppInputsVerified = cppIncludeEnvironment?.observed && cppIncludeEnvironment.inputsVerified === true && !cppIncludeEnvironment.changed;
       const cppEnvironmentVerified = cppInputsVerified && cppIncludeEnvironment.complete;
@@ -1358,8 +1402,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openForRead(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
       const rawResults = cg.searchNodes(search, {
@@ -1431,6 +1474,40 @@ program
  * can reach the graph through a plain shell command.
  */
 program
+  .command('reconcile-ue <path>', { hidden: true })
+  .description('SelfWorkflow UE reconcile protocol 1')
+  .option('--query <text>')
+  .option('--changed-path <path>', 'A known project-relative edit', (value: string, values: string[]) => [...values, value], [])
+  .option('--progress', 'Stream reconciliation phases to stderr')
+  .action(async (projectPath: string, options: { query?: string; changedPath: string[]; progress?: boolean }) => {
+    const { reconcileUe } = await import('./ue-reconcile');
+    const stopParentWatch = watchParent(() => process.exit(1));
+    const cancellation = new AbortController();
+    const cancel = () => cancellation.abort();
+    process.once('SIGINT', cancel);
+    let phase = '', last = 0;
+    try {
+      const result = await reconcileUe(path.resolve(projectPath), {
+        query: options.query,
+        signal: cancellation.signal,
+        paths: options.changedPath.length ? options.changedPath : undefined,
+        onProgress: options.progress ? progress => {
+          const now = Date.now();
+          if (phase !== progress.phase || now - last >= 5000) {
+            process.stderr.write(`[CodeGraph UE] ${progress.phase} ${progress.current}${progress.total ? '/' + progress.total : ''}\n`);
+            phase = progress.phase;
+            last = now;
+          }
+        } : undefined,
+      });
+      console.log(JSON.stringify(result));
+    } finally {
+      process.removeListener('SIGINT', cancel);
+      stopParentWatch();
+    }
+  });
+
+program
   .command('explore <query...>')
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
@@ -1445,7 +1522,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { automaticOpen: 'query' });
       const { ToolHandler } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
@@ -1501,8 +1578,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openForRead(projectPath);
 
       const result = await cg.buildContext(taskParts.join(' '), {
         format,
@@ -1604,8 +1680,9 @@ program
 
       if (plan.exploreRoot) {
         const { default: CodeGraph } = await loadCodeGraph();
-        const cg = await CodeGraph.open(plan.exploreRoot);
+        const cg = await CodeGraph.open(plan.exploreRoot, { automaticOpen: 'query' });
         try {
+          if (cg.getExistingIndexProfile() === 'unverified') return;
           const others = plan.nudgeProjects.length
             ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
             : '';
@@ -1728,7 +1805,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { automaticOpen: 'query' });
       const { ToolHandler } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
@@ -1799,8 +1876,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openForRead(projectPath);
       let files = cg.getFiles();
 
       if (files.length === 0) {
@@ -2334,7 +2410,12 @@ program
       const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
       let removed = false;
       if (fs.existsSync(lockPath)) {
-        fs.unlinkSync(lockPath);
+        // Acquire the same cross-process lease as sync before reclaiming a PID.
+        // A live or unidentifiable owner must never be removed by unlock.
+        const { FileLock } = await import('../utils');
+        const lock = new FileLock(lockPath);
+        lock.acquire();
+        lock.release();
         removed = true;
       }
       const { clearStaleDaemonArtifacts } = await import('../mcp/daemon-registry');
@@ -2372,8 +2453,7 @@ for (const direction of ['callers', 'callees'] as const) {
           process.exit(1);
         }
 
-        const { default: CodeGraph } = await loadCodeGraph();
-        const cg = await CodeGraph.open(projectPath);
+        const cg = await openForRead(projectPath);
         try {
           const limit = parseInt(options.limit || '20', 10);
           const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
@@ -2496,8 +2576,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openForRead(projectPath);
       try {
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
         const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
@@ -2637,8 +2716,7 @@ program
         process.exit(0);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openForRead(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
       // Custom filter pattern

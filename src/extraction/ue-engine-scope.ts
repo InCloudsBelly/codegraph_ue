@@ -23,6 +23,14 @@ const key = (p: string): string => normalize(p).toLowerCase();
 const inside = (p: string, root: string): boolean => key(p) === key(root) || key(p).startsWith(key(root) + '/');
 const forbidden = (p: string): boolean => normalize(p).split('/').some(part => HARD_EXCLUDES.has(part.toLowerCase()) || part.toLowerCase().startsWith('.codegraph'));
 
+/** Syms emits both a whole-file marker and an explicit generator location. */
+function isUeGeneratedSource(source: string): boolean {
+  const head = source.slice(0, 8192);
+  const leading = head.split(/\r?\n/, 8).join('\n');
+  return /^[ \t]*\/\/[ \t]*generated[ \t]*$/im.test(leading) &&
+    /^[ \t]*\/\/~[ \t]*generated from code at [^\r\n]+:\d+[ \t]*$/im.test(head);
+}
+
 interface Plugin { root: string; name: string; modules: string[] }
 export interface UePluginScope {
   roots: string[];
@@ -30,9 +38,12 @@ export interface UePluginScope {
   unresolved: Array<{ file: string; line: number; include: string; candidates: string[] }>;
   depth: number;
   fingerprint: string;
+  layoutFingerprint: string;
   sourceHashes: ReadonlyMap<string, string>;
   configSignature: string;
   incomplete: string[];
+  /** Normalized plugin roots explicitly excluded by the current policy. */
+  explicitlyExcluded: ReadonlySet<string>;
   observationOptions: { knownPlugins?: readonly string[]; discoverNew?: boolean };
   allows(relative: string): boolean;
 }
@@ -113,6 +124,16 @@ export async function probeUeScopeInputs(root: string, config: UeEngineConfig, p
   const excluded = (relative: string): boolean => forbidden(relative) || (matcher?.ignores(relative) ?? false);
   const sources = ['Engine/Source/Runtime', 'Engine/Source/Editor', 'Engine/Source/Developer', 'Engine/Source/Programs',
     'Engine/Programs', ...platformRoots(root, 'Source'), ...config.extraRoots, ...pluginRoots];
+  const sourceRoots = new Set(sources.map(key));
+  const isSelectedSource = (relative: string): boolean => {
+    let parent = key(relative);
+    for (;;) {
+      if (sourceRoots.has(parent)) return true;
+      const separator = parent.lastIndexOf('/');
+      if (separator < 0) return false;
+      parent = parent.slice(0, separator);
+    }
+  };
   const catalogRoots = ['Engine/Plugins', ...platformRoots(root, 'Plugins')];
   const directories = [...new Set([...sources, ...catalogRoots])];
   const queued = new Set<string>();
@@ -190,7 +211,7 @@ export async function probeUeScopeInputs(root: string, config: UeEngineConfig, p
         queued.add(`${key(relative)}:child`);
         directories.push(relative);
       } else if (item.isFile()) {
-        const selectedSource = sources.some(source => inside(relative, source));
+        const selectedSource = isSelectedSource(relative);
         if (item.name === '.gitignore' || /\.uplugin$/i.test(item.name) ||
             (selectedSource ? CPP_FILE.test(relative) : CPP_HEADER.test(relative))) files.push(relative);
       }
@@ -235,10 +256,74 @@ function resolvePluginId(value: string, plugins: readonly Plugin[], field: strin
   return matches[0];
 }
 
+export interface UeObservedSource {
+  readable: boolean;
+  acceptable: boolean;
+  bytes: number;
+  hash: string;
+  stamp: string;
+  includes?: Array<{ spec: string; line: number }>;
+}
+
+/** Bounded cache of observations. Source identity is checked before every reuse. */
+export class UeScopeObservationCache {
+  private readonly entries = new Map<string, UeObservedSource>();
+  private readonly changed = new Set<string>();
+  private bytes = 0;
+  private identity = '';
+  private readonly budget: number;
+
+  constructor(budget = 64 * 1024 * 1024) {
+    this.budget = Number.isFinite(budget) ? Math.max(0, budget) : 64 * 1024 * 1024;
+  }
+
+  bind(root: string, config: string): void {
+    const identity = JSON.stringify([process.platform === 'win32' ? root.toLowerCase() : root, config]);
+    if (identity !== this.identity) { this.clear(); this.identity = identity; }
+  }
+  get(file: string): UeObservedSource | undefined { return this.entries.get(file); }
+  delete(file: string): void {
+    const prior = this.entries.get(file);
+    if (prior) { this.bytes -= prior.bytes; this.entries.delete(file); }
+  }
+  set(file: string, observation: UeObservedSource): void {
+    this.seed(file, observation);
+    if (this.entries.has(file)) this.changed.add(file);
+  }
+  seed(file: string, observation: UeObservedSource): void {
+    this.delete(file);
+    if (this.bytes + observation.bytes <= this.budget) {
+      this.entries.set(file, observation);
+      this.bytes += observation.bytes;
+    }
+  }
+  invalidateChanged(): void {
+    for (const file of this.changed) this.delete(file);
+  }
+  *changes(): Iterable<[string, UeObservedSource]> {
+    for (const file of this.changed) {
+      const observation = this.entries.get(file);
+      if (observation) yield [file, observation];
+    }
+  }
+  clear(): void { this.entries.clear(); this.changed.clear(); this.bytes = 0; this.identity = ''; }
+}
+
+function sourceStamp(file: string): string {
+  const stat = fs.lstatSync(file, { bigint: true });
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Source is no longer an unlinked regular file');
+  return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
 export interface UeScopeBuildOptions {
   knownPlugins?: readonly string[];
   discoverNew?: boolean;
   admit?: (file: string) => boolean;
+  /** In-memory observation budget; zero disables reuse for verification/tests. */
+  observationCacheBytes?: number;
+  observationCache?: UeScopeObservationCache;
+  onObserved?: (count: number) => void;
+  signal?: AbortSignal;
 }
 
 /** Compute one deterministic scope as resumable file and directory steps. */
@@ -264,18 +349,29 @@ function* buildUeEngineScopeSteps(
   };
   const plugins = yield* discoverPluginSteps(root);
   const excluded = new Set(config.excludePlugins.map(value => resolvePluginId(value, plugins, 'excludePlugins')).filter((p): p is Plugin => !!p).map(p => key(p.root)));
+  // Exact paths remain authoritative even if the corresponding manifest has
+  // already disappeared; names need an unambiguous discovered manifest.
+  for (const value of config.excludePlugins) if (value.includes('/')) excluded.add(key(value));
+  // A regular ignore rule that excludes the plugin directory itself excludes
+  // the whole subtree; a rule for just one child is not enough to remove it.
+  for (const plugin of plugins) if (excludedPath(`${plugin.root}/`)) excluded.add(key(plugin.root));
+  for (const previous of options.knownPlugins ?? []) if (excludedPath(`${previous}/`)) excluded.add(key(previous));
   const seeds = config.plugins.map(value => resolvePluginId(value, plugins, 'plugins')!).filter(plugin => !excluded.has(key(plugin.root)));
   const known = options.knownPlugins ? new Set(options.knownPlugins.map(key)) : undefined;
   const coreRoots = ['Engine/Source/Runtime', 'Engine/Source/Editor', 'Engine/Source/Developer', 'Engine/Source/Programs', 'Engine/Programs', ...platformRoots(root, 'Source'), ...config.extraRoots];
   const sourceObservations = new Map<string, string>();
   const incomplete = new Set<string>();
-  const readSource = (file: string): string | null => {
+  const readSource = (file: string): { value: string | null; hash: string; stamp: string } => {
     try {
-      const observed = readBoundedSourceSync(path.join(root, file));
+      const absolute = path.join(root, file);
+      const stamp = sourceStamp(absolute);
+      const observed = readBoundedSourceSync(absolute);
+      if (sourceStamp(absolute) !== stamp) throw new Error('Source changed while it was read');
       const value = observed.bytes === null ? null : observed.bytes.toString('utf8');
-      sourceObservations.set(file, createHash('sha256').update(value === null ? oversizeStamp(observed.stats.size) : value).digest('hex'));
+      const hash = createHash('sha256').update(value === null ? oversizeStamp(observed.stats.size) : value).digest('hex');
+      sourceObservations.set(file, hash);
       if (value === null) incomplete.add(file);
-      return value;
+      return { value, hash, stamp };
     } catch (error) {
       throw new ConfigError(`Cannot read UE scope source ${file}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -283,7 +379,8 @@ function* buildUeEngineScopeSteps(
   const acceptableContent = (file: string, source: string | null): boolean => {
     if (source === null) return true; // retained as an explicitly incomplete observation
     const language = detectLanguage(file, source, overrides, root);
-    return (language === 'c' || language === 'cpp') && !detectGeneratedFile(file, source) && !isUeTestOnlyFile(source);
+    return (language === 'c' || language === 'cpp') && !detectGeneratedFile(file, source) &&
+      !isUeGeneratedSource(source) && !isUeTestOnlyFile(source);
   };
   const catalog = new Map<string, Array<{ file: string; plugin?: Plugin }>>();
   const seenHeaders = new Set<string>();
@@ -324,31 +421,60 @@ function* buildUeEngineScopeSteps(
       if (match) callback(match[1]!, at + 1);
     }
   };
+  // Discovery and selected-file reporting revisit the same sources. Retain
+  // only their admission verdict and include sites during this observation;
+  // do not retain source bodies or reuse this cache for later admission.
+  const observedSources = options.observationCache ?? new UeScopeObservationCache(options.observationCacheBytes);
+  observedSources.bind(rootReal, configSignature);
+  const observe = (file: string, includeSites: boolean) => {
+    const existing = observedSources.get(file);
+    if (existing) {
+      try {
+        if (sourceStamp(path.join(root, file)) === existing.stamp && (!includeSites || existing.includes !== undefined)) {
+          sourceObservations.set(file, existing.hash);
+          if (!existing.readable) incomplete.add(file);
+          return existing;
+        }
+      } catch (error) {
+        throw new ConfigError(`Cannot recheck UE scope source ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      observedSources.delete(file);
+    }
+    const { value: source, hash, stamp } = readSource(file);
+    const acceptable = acceptableContent(file, source);
+    const includes: Array<{ spec: string; line: number }> = [];
+    if (includeSites && source !== null && acceptable) {
+      forEachInclude(source, (spec, line) => includes.push({ spec, line }));
+    }
+    const bytes = 128 + file.length * 2 + includes.reduce((sum, site) => sum + 80 + site.spec.length * 2, 0);
+    const observation = { readable: source !== null, acceptable, bytes, hash, stamp, ...(includeSites ? { includes } : {}) };
+    observedSources.set(file, observation);
+    return observation;
+  };
   let frontier = [...coreRoots, ...seeds.map(p => p.root)];
   const targetDepth = Math.min(Math.max(0, depth), config.maxDepth);
   for (let layer = 1; layer <= targetDepth && frontier.length; layer++) {
     const next = new Map<string, Plugin>();
     const inspectFrontierFile = (file: string): void => {
       if (!CPP_FILE.test(file) || UE_GENERATED.test(file)) return;
-      const source = readSource(file);
-      if (source === null) return;
-      if (!acceptableContent(file, source)) return;
-      forEachInclude(source, written => {
-        const spec = normalize(written);
+      const observation = observe(file, true);
+      if (!observation.readable || !observation.acceptable) return;
+      for (const include of observation.includes ?? []) {
+        const spec = normalize(include.spec);
         // A bare basename or path traversal is not strong enough to choose a plugin.
-        if (!spec.includes('/') || spec.split('/').some(part => part === '.' || part === '..')) return;
+        if (!spec.includes('/') || spec.split('/').some(part => part === '.' || part === '..')) continue;
         const hits = catalog.get(key(spec)) ?? [];
         const candidates = [...new Set(hits.map(hit => hit.plugin?.root ?? ''))];
         if (hits.length !== 1 || candidates.length !== 1 || !hits[0]!.plugin) {
-          return;
+          continue;
         }
         const plugin = hits[0]!.plugin!;
         const first = spec.split('/')[0]!.toLowerCase();
-        if (first !== plugin.name.toLowerCase() && !plugin.modules.some(name => name.toLowerCase() === first)) return;
-        const targetSource = readSource(hits[0]!.file);
-        if (targetSource === null || !acceptableContent(hits[0]!.file, targetSource)) return;
+        if (first !== plugin.name.toLowerCase() && !plugin.modules.some(name => name.toLowerCase() === first)) continue;
+        const targetSource = observe(hits[0]!.file, false);
+        if (!targetSource.readable || !targetSource.acceptable) continue;
         if (!selected.has(key(plugin.root)) && (options.discoverNew !== false || !known || known.has(key(plugin.root)))) next.set(key(plugin.root), plugin);
-      });
+      }
     };
     for (const directory of frontier) for (const file of walk(directory)) {
       if (file) inspectFrontierFile(file);
@@ -364,37 +490,44 @@ function* buildUeEngineScopeSteps(
   }
   const roots = [...new Set([...coreRoots, ...[...selected.values()].map(value => value.plugin.root)])];
   const seenReferences = new Set<string>();
+  const sourceAdmission = new Map<string, 'admitted' | 'excluded' | 'oversized'>();
   // Include the newest layer in the snapshot and retain unselected plugin
   // header candidates without parsing any of those plugins' implementations.
   const inspectSelectedFile = (file: string): void => {
     if (!CPP_FILE.test(file) || UE_GENERATED.test(file)) return;
-    const source = readSource(file);
-    if (source === null || !acceptableContent(file, source)) return;
-    forEachInclude(source, (spec, line) => {
+    const observation = observe(file, true);
+    sourceAdmission.set(file, !observation.acceptable ? 'excluded' : observation.readable ? 'admitted' : 'oversized');
+    if (!observation.readable || !observation.acceptable) return;
+    for (const { spec, line } of observation.includes ?? []) {
       const hits = catalog.get(key(spec)) ?? [];
-      if (!hits.some(hit => hit.plugin && !selected.has(key(hit.plugin.root)))) return;
+      if (!hits.some(hit => hit.plugin && !selected.has(key(hit.plugin.root)))) continue;
       const reference = `${key(file)}\0${line}\0${key(spec)}`;
-      if (seenReferences.has(reference)) return;
+      if (seenReferences.has(reference)) continue;
       seenReferences.add(reference);
       const matches = [...new Set(hits.map(hit => hit.file))].sort();
       const candidates = matches.slice(0, 32);
       if (matches.length > 32) candidates.push(`… ${matches.length - 32} more candidates; narrow the source scope`);
       unresolved.push({ file, line, include: spec, candidates });
-    });
+    }
   };
   for (const directory of roots) for (const file of walk(directory)) {
     if (file) inspectSelectedFile(file);
     yield;
   }
+  const pluginLayout = [...selected.values()].map(value => [value.plugin.root, value.depth]).sort();
+  const headerCatalog = [...catalog.entries()].map(([name, hits]) => [name, hits.map(hit => hit.file).sort()]).sort();
   const fingerprint = createHash('sha256').update(JSON.stringify({
-    configSignature, exclusionPatterns, depth: targetDepth,
-    plugins: [...selected.values()].map(value => [value.plugin.root, value.depth]).sort(),
-    catalog: [...catalog.entries()].map(([name, hits]) => [name, hits.map(hit => hit.file).sort()]).sort(),
+    configSignature, exclusionPatterns, depth: targetDepth, plugins: pluginLayout, catalog: headerCatalog,
     sources: [...sourceObservations.entries()].sort(),
   })).digest('hex');
+  const layoutFingerprint = createHash('sha256').update(JSON.stringify({
+    configSignature, exclusionPatterns, plugins: pluginLayout, catalog: headerCatalog,
+    sources: [...sourceAdmission.entries()].sort(),
+  })).digest('hex');
+  if (!options.observationCache) observedSources.clear();
   const testCache = new Map<string, boolean>();
   return {
-    roots, depth: targetDepth, unresolved, fingerprint, sourceHashes: sourceObservations, configSignature, incomplete: [...incomplete].sort(),
+    roots, depth: targetDepth, unresolved, fingerprint, layoutFingerprint, sourceHashes: sourceObservations, configSignature, incomplete: [...incomplete].sort(), explicitlyExcluded: excluded,
     observationOptions: { knownPlugins: options.knownPlugins, discoverNew: options.discoverNew },
     plugins: [...selected.values()].map(value => ({ root: value.plugin.root, depth: value.depth, manual: value.manual })),
     allows(relative: string): boolean {
@@ -419,7 +552,7 @@ function* buildUeEngineScopeSteps(
       }
       let testOnly = testCache.get(rel);
       if (testOnly === undefined) {
-        try { const source = readSource(rel); testOnly = !acceptableContent(rel, source); }
+        try { testOnly = !observe(rel, false).acceptable; }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
           throw new ConfigError(`Cannot read UE source ${rel}: ${error instanceof Error ? error.message : String(error)}`);
@@ -444,11 +577,15 @@ export function buildUeEngineScope(root: string, config: UeEngineConfig, depth =
 export async function buildUeEngineScopeAsync(root: string, config: UeEngineConfig, depth = 1, options: UeScopeBuildOptions = {}): Promise<UePluginScope> {
   const steps = buildUeEngineScopeSteps(root, config, depth, options);
   let started = Date.now(), count = 0;
+  options.signal?.throwIfAborted();
+  options.onObserved?.(0);
   for (;;) {
     const step = steps.next();
-    if (step.done) return step.value;
+    if (step.done) { options.onObserved?.(count); return step.value; }
     if (++count % 32 === 0 && Date.now() - started >= 15) {
+      options.onObserved?.(count);
       await new Promise<void>(resolve => setImmediate(resolve));
+      options.signal?.throwIfAborted();
       started = Date.now();
     }
   }

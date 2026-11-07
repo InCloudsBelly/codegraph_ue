@@ -7,7 +7,7 @@ import { buildScopeIgnore, scanDirectory, scanDirectoryAsync } from '../src/extr
 import { getCodeGraphDir, removeDirectory } from '../src/directory';
 import { FileWatcher } from '../src/sync/watcher';
 import { getIndexingConfigStatus, loadIndexingConfig } from '../src/indexing-config';
-import { validatePathWithinRoot } from '../src/utils';
+import { FileLock, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src';
 
 describe('private UE indexing scope', () => {
@@ -141,6 +141,31 @@ describe('private UE indexing scope', () => {
     expect(fs.readFileSync(path.join(getCodeGraphDir(dir), 'indexing.json'), 'utf8')).toBe(raw);
     expect(fs.existsSync(path.join(getCodeGraphDir(dir), 'codegraph.db'))).toBe(false);
     expect(fs.existsSync(path.join(getCodeGraphDir(dir), '.gitignore'))).toBe(true);
+  });
+
+  it('refuses cleanup before deleting any graph data while the write lease exists', () => {
+    const graphDir = getCodeGraphDir(dir);
+    write(dir, path.relative(dir, path.join(graphDir, 'indexing.json')), '{ "ueEngine": { "plugins": [] } }\n');
+    write(dir, path.relative(dir, path.join(graphDir, 'codegraph.db')), 'fixture');
+    const lock = new FileLock(path.join(graphDir, 'codegraph.lock'));
+    lock.acquire();
+    try {
+      expect(() => removeDirectory(dir)).toThrow(/lease/i);
+      expect(fs.readFileSync(path.join(graphDir, 'codegraph.db'), 'utf8')).toBe('fixture');
+      expect(fs.existsSync(path.join(graphDir, 'codegraph.lock.lease'))).toBe(true);
+    } finally { lock.release(); }
+  });
+
+  it('keeps an initialized UE graph open when reader lifetimes cannot be verified', () => {
+    privateConfig({ ueEngine: { plugins: [] } });
+    const graph = CodeGraph.initSync(dir);
+    const other = CodeGraph.openSync(dir);
+    try {
+      expect(() => graph.uninitialize()).toThrow(/connections/i);
+      expect(CodeGraph.isInitialized(dir)).toBe(true);
+      expect(graph.getStats()).toBeDefined();
+      expect(other.getStats()).toBeDefined();
+    } finally { graph.close(); other.close(); }
   });
 
   it('indexes and syncs linked plugin source while keeping content reads confined to the root', async () => {

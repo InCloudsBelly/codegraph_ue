@@ -38,6 +38,7 @@ import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
+import { UE_CPP_DECLARATION, UE_CPP_UNCERTAIN_LINKAGE } from './ue-cpp-declarations';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -747,12 +748,13 @@ export class TreeSitterExtractor {
   // don't blank it a second time.
   private sourceIsPreParsed = false;
   private originalSource: string;
+  private ueCppDeclarations = false;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean; originalSource?: string }
+    options?: { sourceIsPreParsed?: boolean; originalSource?: string; ueCppDeclarations?: boolean }
   ) {
     this.filePath = filePath;
     this.source = source;
@@ -761,6 +763,7 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+    this.ueCppDeclarations = options?.ueCppDeclarations === true;
   }
 
   /**
@@ -886,6 +889,12 @@ export class TreeSitterExtractor {
             `the file is indexed but contributes nothing to the graph`,
           severity: 'warning',
           code: 'parse_error',
+        });
+      } else if (this.tree?.rootNode.hasError && this.ueCppDeclarations && (this.language === 'c' || this.language === 'cpp')) {
+        this.errors.push({
+          message: `${this.filePath}: parser recovered some symbols but the syntax tree contains errors; relationships may be incomplete`,
+          severity: 'warning',
+          code: 'partial_parse',
         });
       }
     } catch (error) {
@@ -1470,6 +1479,34 @@ export class TreeSitterExtractor {
         this.extractFunction(node);
         skipChildren = true; // extractFunction visits children via visitFunctionBody
       }
+    }
+    // UE source navigation also needs free-function declarations in headers.
+    // A function-pointer variable has a parenthesized declarator and must not
+    // become a function. Definitions continue through the normal branch above.
+    else if (this.ueCppDeclarations && (this.language === 'cpp' || this.language === 'c') &&
+      nodeType === 'declaration' && !this.isInsideClassLikeNode() && this.ueFunctionDeclarators(node).length > 0) {
+      const declarations = this.ueFunctionDeclarators(node);
+      const definedType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
+      if (definedType && isClassLikeDefinition(definedType)) this.visitNode(definedType);
+      for (const { declarator, name } of declarations) {
+        this.extractFunction(node, name, declarator);
+      }
+      const functionIds = new Set(declarations.map(entry => entry.declarator.id));
+      for (const declarator of node.childrenForFieldName('declarator')) {
+        if (!declarator || functionIds.has(declarator.id)) continue;
+        const name = cDeclaratorIdentifier(declarator);
+        if (!name) continue;
+        const value = declarator.type === 'init_declarator' ? getChildByField(declarator, 'value') : null;
+        const initial = value ? getNodeText(value, this.source).slice(0, 100) : undefined;
+        const variable = this.createNode(this.extractor.isConst?.(node) ? 'constant' : 'variable', getNodeText(name, this.source), declarator, {
+          docstring: this.docstringFor(node),
+          isExported: this.extractor.isExported?.(node, this.source) ?? false,
+          signature: initial ? `= ${initial}${initial.length >= 100 ? '...' : ''}` : undefined,
+        });
+        if (variable) this.extractVariableTypeAnnotation(declarator, variable.id);
+      }
+      this.scanFnRefSubtree(node, 0, definedType && isClassLikeDefinition(definedType) ? new Set([definedType.id]) : undefined);
+      skipChildren = true;
     }
     // A bodiless function that no implementation follows: a TypeScript
     // `declare function`, a `.d.ts` file's own or its `declare module` body's.
@@ -2084,7 +2121,40 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
-  private extractFunction(node: SyntaxNode, nameOverride?: string): void {
+  private ueFunctionDeclarators(node: SyntaxNode): Array<{ declarator: SyntaxNode; name: string }> {
+    const functions: Array<{ declarator: SyntaxNode; name: string }> = [];
+    for (const outer of node.childrenForFieldName('declarator')) {
+      if (!outer) continue;
+      let declarator: SyntaxNode | null = outer;
+      while (declarator && (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator')) {
+        declarator = getChildByField(declarator, 'declarator') ?? declarator.namedChild(0);
+      }
+      if (declarator?.type !== 'function_declarator') continue;
+      const name = getChildByField(declarator, 'declarator');
+      if (!name || !['identifier', 'qualified_identifier'].includes(name.type)) continue;
+      functions.push({ declarator: outer, name: getNodeText(name, this.source).split('::').pop()! });
+    }
+    return functions;
+  }
+
+  /** Preserve UE function heads so signature edits invalidate dependent edges. */
+  private ueCppSignature(node: SyntaxNode, declarator?: SyntaxNode): string | undefined {
+    if (!this.ueCppDeclarations || (this.language !== 'cpp' && this.language !== 'c')) return undefined;
+    if (declarator) {
+      const first = node.childrenForFieldName('declarator')[0];
+      if (!first) return undefined;
+      return (this.originalSource.slice(node.startIndex, first.startIndex) +
+        this.originalSource.slice(declarator.startIndex, declarator.endIndex)).trim() || undefined;
+    }
+    let start = node.startIndex;
+    for (let parent = node.parent; parent?.type === 'template_declaration'; parent = parent.parent) {
+      start = parent.startIndex;
+    }
+    const body = getChildByField(node, 'body');
+    return this.originalSource.slice(start, body?.startIndex ?? node.endIndex).trim() || undefined;
+  }
+
+  private extractFunction(node: SyntaxNode, nameOverride?: string, ueDeclarator?: SyntaxNode): void {
     if (!this.extractor) return;
 
     // If the language provides getReceiverType and this function has a receiver
@@ -2156,14 +2226,16 @@ export class TreeSitterExtractor {
     }
 
     const docstring = this.docstringFor(node);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.source) ?? this.ueCppSignature(node, ueDeclarator);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
-    const isStatic = this.extractor.isStatic?.(node);
+    const isStatic = this.extractor.isStatic?.(node) ||
+      (this.ueCppDeclarations && (this.language === 'cpp' || this.language === 'c') &&
+        node.namedChildren.some(child => child.type === 'storage_class_specifier' && child.text === 'static'));
     const returnType = this.extractor.getReturnType?.(node, this.source);
 
-    const funcNode = this.createNode('function', name, node, {
+    const funcNode = this.createNode('function', name, ueDeclarator ?? node, {
       docstring,
       signature,
       visibility,
@@ -2173,9 +2245,63 @@ export class TreeSitterExtractor {
       returnType,
     });
     if (!funcNode) return;
+    if (this.ueCppDeclarations && (this.language === 'cpp' || this.language === 'c') && node.type === 'declaration') {
+      funcNode.decorators = [...(funcNode.decorators ?? []), UE_CPP_DECLARATION];
+    }
+    if (this.ueCppDeclarations && this.language === 'cpp') {
+      for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type === 'template_declaration' || parent.type === 'linkage_specification' ||
+            (parent.type === 'namespace_definition' && !getChildByField(parent, 'name'))) {
+          funcNode.decorators = [...(funcNode.decorators ?? []), UE_CPP_UNCERTAIN_LINKAGE];
+          break;
+        }
+      }
+    }
 
-    // Extract type annotations (parameter types and return type)
-    this.extractTypeAnnotations(node, funcNode.id);
+    // UE C/C++ declarations need their own type-position walk: C/C++ is not
+    // in TYPE_ANNOTATION_LANGUAGES, and a pointer/reference return wraps the
+    // function declarator. Do not walk parameter names or default expressions.
+    if (ueDeclarator && this.ueCppDeclarations && (this.language === 'cpp' || this.language === 'c')) {
+      const templateNames = new Set<string>();
+      for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type !== 'template_declaration') continue;
+        const list = parent.namedChildren.find(child => child.type === 'template_parameter_list');
+        for (const parameter of list?.namedChildren ?? []) {
+          const declaration = parameter.type === 'template_template_parameter_declaration'
+            ? parameter.namedChildren.find(child => child.type === 'type_parameter_declaration') : parameter;
+          if (!declaration || !['type_parameter_declaration', 'optional_type_parameter_declaration', 'variadic_type_parameter_declaration'].includes(declaration.type)) continue;
+          const name = declaration.namedChildren.find(child => child.type === 'type_identifier');
+          if (name) templateNames.add(getNodeText(name, this.source));
+        }
+      }
+      let signature: SyntaxNode | null = ueDeclarator;
+      while (signature && (signature.type === 'pointer_declarator' || signature.type === 'reference_declarator')) {
+        signature = getChildByField(signature, 'declarator') ?? signature.namedChild(0);
+      }
+      const inspectParameters = (parameters: SyntaxNode): void => {
+        for (const parameter of parameters.namedChildren) {
+          const type = getChildByField(parameter, 'type');
+          if (type && !isClassLikeDefinition(type)) this.extractTypeRefsFromSubtree(type, funcNode.id, templateNames);
+          // A function-pointer parameter has a nested parameter list inside
+          // its declarator. Follow declarators only, never array sizes/defaults.
+          let declarator = getChildByField(parameter, 'declarator');
+          while (declarator) {
+            if (declarator.type === 'function_declarator') {
+              const nested = getChildByField(declarator, 'parameters');
+              if (nested) inspectParameters(nested);
+            }
+            declarator = getChildByField(declarator, 'declarator') ??
+              declarator.namedChildren.find(child => /^(?:parenthesized|pointer|reference|array|function|abstract_.*)_declarator$/.test(child.type)) ?? null;
+          }
+        }
+      };
+      const parameters = signature && getChildByField(signature, 'parameters');
+      if (parameters) inspectParameters(parameters);
+      const returnTypeNode = getChildByField(node, 'type');
+      if (returnTypeNode && !isClassLikeDefinition(returnTypeNode)) this.extractTypeRefsFromSubtree(returnTypeNode, funcNode.id, templateNames);
+    } else {
+      this.extractTypeAnnotations(ueDeclarator ?? node, funcNode.id);
+    }
 
     // Extract decorators applied to the function (rare in JS/TS but
     // present in Python `@decorator def f():` and Java/Kotlin
@@ -2517,7 +2643,7 @@ export class TreeSitterExtractor {
     }
 
     const docstring = this.docstringFor(node);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.source) ?? this.ueCppSignature(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
@@ -8163,10 +8289,10 @@ export class TreeSitterExtractor {
    * Recursively walk a subtree and extract all type_identifier references.
    * Handles unions, intersections, generics, arrays, etc.
    */
-  private extractTypeRefsFromSubtree(node: SyntaxNode, fromNodeId: string): void {
+  private extractTypeRefsFromSubtree(node: SyntaxNode, fromNodeId: string, ignoredNames?: ReadonlySet<string>): void {
     if (node.type === 'type_identifier') {
       const typeName = getNodeText(node, this.source);
-      if (typeName && !this.BUILTIN_TYPES.has(typeName)) {
+      if (typeName && !this.BUILTIN_TYPES.has(typeName) && !ignoredNames?.has(typeName)) {
         this.unresolvedReferences.push({
           fromNodeId,
           referenceName: typeName,
@@ -8182,7 +8308,7 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child) {
-        this.extractTypeRefsFromSubtree(child, fromNodeId);
+        this.extractTypeRefsFromSubtree(child, fromNodeId, ignoredNames);
       }
     }
   }
@@ -8732,7 +8858,8 @@ export function extractFromSource(
   filePath: string,
   source: string,
   language?: Language,
-  frameworkNames?: string[]
+  frameworkNames?: string[],
+  ueCppDeclarations = false
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -8791,7 +8918,7 @@ export function extractFromSource(
     // Native-kernel route (docs/design/rust-kernel-migration-plan.md): gated
     // per language, null when not routed/available or on a kernel error —
     // the wasm TreeSitterExtractor below stays the fallback either way.
-    const kernelResult = tryKernelExtract(filePath, source, detectedLanguage);
+    const kernelResult = ueCppDeclarations ? null : tryKernelExtract(filePath, source, detectedLanguage);
     if (kernelResult) {
       result = kernelResult;
       if (detectedLanguage === 'cpp') {
@@ -8806,7 +8933,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        { sourceIsPreParsed: deferredPre != null, originalSource: source }
+        { sourceIsPreParsed: deferredPre != null, originalSource: source, ueCppDeclarations }
       );
       result = extractor.extract();
     }

@@ -12,6 +12,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { ExtractionError, Language } from '../types';
 import { hasUnrealCppDeclaration } from './languages/unreal-macros';
+import { blankStringContents, stripCommentsForRegex } from '../resolution/strip-comments';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -750,6 +751,83 @@ const C_COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
  * shape with no C reading, so widening it to the whole file cannot drag a C
  * header over to C++.
  */
+/** Recognize simple reference parameters without backtracking over whole headers. */
+function hasCppReferenceParameter(code: string): boolean {
+  if (!code.includes('&')) return false;
+  let statementStart = 0, parameterStart = 0, lineStart = 0;
+  let parens = 0, brackets = 0, braces = 0;
+  let declaration = false, directive = false, lineWhitespace = true, statementHasCode = false;
+  for (let i = 0; i < code.length; i++) {
+    const char = code[i]!;
+    if (char === '\n') {
+      if (directive) {
+        let last = i - 1;
+        while (last >= lineStart && (code[last] === ' ' || code[last] === '\t' || code[last] === '\r')) last--;
+        directive = last >= lineStart && code[last] === '\\';
+        statementStart = i + 1;
+        statementHasCode = false;
+      } else if (parens === 0 && !statementHasCode) {
+        statementStart = i + 1;
+      }
+      lineStart = i + 1;
+      lineWhitespace = true;
+      continue;
+    }
+    if (lineWhitespace && (char === ' ' || char === '\t' || char === '\r')) {
+      if (!directive && parens === 0 && !statementHasCode) statementStart = i + 1;
+      continue;
+    }
+    if (lineWhitespace) {
+      lineWhitespace = false;
+      if (char === '#') { directive = true; parens = 0; brackets = 0; braces = 0; declaration = false; statementHasCode = false; }
+    }
+    if (directive) continue;
+    if (parens === 0) {
+      if (char === ';' || char === '{' || char === '}') { statementStart = i + 1; statementHasCode = false; continue; }
+      if (char !== '(') {
+        if (!/\s/.test(char)) statementHasCode = true;
+        else if (!statementHasCode) statementStart = i + 1;
+        continue;
+      }
+      const prefix = i - statementStart <= 4096 ? code.slice(statementStart, i).trim() : '';
+      const words = prefix.match(/[A-Za-z_]\w*/g) ?? [];
+      const builtinReturn = words.slice(0, -1).some(word =>
+        /^(?:void|char|short|int|long|float|double|signed|unsigned|_Bool)$/.test(word));
+      // Two adjacent identifier-like words distinguish a declaration from a
+      // call or a C arithmetic expression. A pointer or reference return is
+      // accepted only when a reserved built-in type makes it unambiguous.
+      const prefixChars = builtinReturn ? /^[A-Za-z_][A-Za-z0-9_:\s<>*&]*$/ : /^[A-Za-z_][A-Za-z0-9_:\s<>]*$/;
+      declaration = words.length >= 2 && prefixChars.test(prefix) && !/(^|[^:]):(?!:)/.test(prefix) &&
+        !/^(?:return|throw|if|else|do|while|switch|for|sizeof|case|default|goto|break|continue|__extension__|__real(?:__)?|__imag(?:__)?|__alignof(?:__)?|__typeof(?:__)?|typeof|_Alignof|_Generic)\b/.test(prefix);
+      parens = 1;
+      brackets = 0;
+      braces = 0;
+      parameterStart = i + 1;
+      continue;
+    }
+    if (char === '(') { parens++; continue; }
+    if (char === ')') { parens--; continue; }
+    if (char === '[') { brackets++; continue; }
+    if (char === ']') { if (brackets) brackets--; continue; }
+    if (char === '{') { braces++; continue; }
+    if (char === '}') { if (braces) braces--; continue; }
+    if (parens !== 1 || brackets !== 0 || braces !== 0) continue;
+    if (char === ',') { parameterStart = i + 1; continue; }
+    if (char !== '&' || !declaration || i - parameterStart > 1024) continue;
+    const type = code.slice(parameterStart, i).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_:\s<>*]*$/.test(type) || /(^|[^:]):(?!:)/.test(type) || /\b(?:return|sizeof)\b/.test(type)) continue;
+    let next = i + (code[i + 1] === '&' ? 2 : 1);
+    while (next < code.length && /\s/.test(code[next]!)) next++;
+    if (/[A-Za-z_]/.test(code[next] ?? '')) {
+      next++;
+      while (next < code.length && /\w/.test(code[next]!)) next++;
+      while (next < code.length && /\s/.test(code[next]!)) next++;
+    }
+    if ([',', ')', '='].includes(code[next] ?? '')) return true;
+  }
+  return false;
+}
+
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
   // The `class MACRO Name : Base` / `class MACRO Name { … }` branch mirrors what
@@ -765,6 +843,14 @@ function looksLikeCpp(source: string): boolean {
     return true;
   }
   if (hasUnrealCppDeclaration(source)) return true;
+  // A class forward declaration is valid C++ but not C. Do not interpret a
+  // matching example in a comment or string as a language signal.
+  const codeOnly = blankStringContents(stripCommentsForRegex(source, 'cpp'));
+  if (/\bclass\s+(?:[A-Z][A-Z0-9_]+\s+)?[A-Za-z_]\w*\s*;/.test(codeOnly)) return true;
+  // A reference parameter in a function declaration is another C++-only
+  // signal. Anchor it to a declaration-shaped prefix so C expressions such as
+  // `return foo(a & b)` do not change the file's language.
+  if (hasCppReferenceParameter(codeOnly)) return true;
   // Plain `struct Derived : Base` (no export macro, no `class` keyword, no
   // explicit access section) — the #1159 branch above only recognizes the
   // macro-annotated form. Scanned over the whole file, not the sample, with

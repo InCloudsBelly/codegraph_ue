@@ -55,7 +55,14 @@ export function acquireProject(
     release: () => {
       if (released) return Promise.resolve();
       released = true;
-      if (--entry.refs === 0) return retire(root, entry);
+      if (--entry.refs === 0) {
+        return retire(root, entry).catch(error => {
+          // The lease is still the owner's retry handle when close failed.
+          entry.refs++;
+          released = false;
+          throw error;
+        });
+      }
       return Promise.resolve();
     },
   };
@@ -64,7 +71,8 @@ export function acquireProject(
 function retire(root: string, project: Project): Promise<void> {
   if (project.retirement) return project.retirement;
   let resolve!: () => void;
-  const retirement = new Promise<void>((done) => { resolve = done; });
+  let reject!: (error: unknown) => void;
+  const retirement = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
   project.retirement = retirement;
   clearInterval(project.timer);
   project.socket?.destroy();
@@ -83,9 +91,20 @@ function retire(root: string, project: Project): Promise<void> {
       setTimeout(finish, 25);
       return;
     }
-    projects.delete(project.key);
-    project.cg.close();
+    try {
+      project.cg.close();
+    } catch (error) {
+      // Keep the graph and writer slot discoverable: the lock may still be
+      // owned, and a later lease can retry the release after I/O recovers.
+      project.retirement = null;
+      project.caughtUp = false;
+      project.timer = setInterval(() => { void ready(root, project); }, 1000);
+      project.timer.unref();
+      reject(error);
+      return;
+    }
     if (project.owner) releaseWriterLock(root);
+    projects.delete(project.key);
     resolve();
   };
   finish();
@@ -145,8 +164,8 @@ async function activate(root: string, project: Project): Promise<void> {
     return;
   }
   project.owner = true;
-  if (project.cg.hasUeScopeProfile?.()) {
-    // UE profiles synchronize when a query is made, not through a watcher.
+  if (project.cg.getExistingIndexProfile() !== 'generic') {
+    // Only a verified ordinary index uses a watcher and startup catch-up.
     project.caughtUp = true;
     markWriterReady(root);
     return;

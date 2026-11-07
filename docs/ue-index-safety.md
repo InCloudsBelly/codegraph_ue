@@ -6,7 +6,7 @@ UE 引擎源码策略、插件范围和使用前更新规则见 [UE 引擎源码
 
 显式 `init` 不覆盖已有数据库、WAL、SHM 或 rollback journal。需要重建时，用独立的 `CODEGRAPH_DIR=.codegraph-candidate` 构建候选，保留原库，验证后再发布。不要删除旧库来让初始化继续。
 
-`scripts/publish-validated-index.cjs` 只发布已经验证的候选，不打开 SQLite、不执行同步或索引。Windows 下先拒绝正在运行或命令行无法确认的 Node/CodeGraph 消费者，再同时持有正式库和候选库的协作锁。发布前核对验证记录、数据库身份和时间戳，旧库移动到唯一备份目录。
+`scripts/publish-validated-index.cjs` 只发布已经验证的候选，不打开 SQLite、不执行同步或索引。Windows 下先拒绝正在运行或命令行无法确认的 Node/CodeGraph 消费者，再同时持有正式库和候选库的协作锁。发布前核对验证记录、数据库身份和时间戳，旧库移动到唯一备份目录。切换后从实际消费者验证一次查询和修改后的增量可见性。已有会话连接需要单独确认，重新连接后复验。
 
 ```powershell
 node scripts/publish-validated-index.cjs --project-root E:\project --index-directory .codegraph --candidate-directory .codegraph-candidate --validation E:\evidence\validation.json

@@ -242,6 +242,8 @@ export function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+export class FileLockBusyError extends Error {}
+
 /**
  * Cross-process file lock using a lock file with PID tracking.
  *
@@ -251,6 +253,8 @@ export function escapeRegExp(text: string): string {
 export class FileLock {
   private lockPath: string;
   private held = false;
+  private releasePending = false;
+  private lease: { exec(sql: string): void; close(): void } | null = null;
 
   constructor(lockPath: string) {
     this.lockPath = lockPath;
@@ -260,44 +264,61 @@ export class FileLock {
    * Acquire the lock. Throws if the lock is held by another live process.
    */
   acquire(): void {
-    // Check for existing lock
-    if (fs.existsSync(this.lockPath)) {
-      try {
-        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-        const pid = parseInt(content, 10);
-        // A long sync can hold the lock for hours. Its age says nothing about
-        // whether the writer is still alive; only a dead PID is stale.
-        if (!isNaN(pid) && this.isProcessAlive(pid)) {
-          throw new Error(
-            `CodeGraph database is locked by another process (PID ${pid}). ` +
-            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-          );
-        }
-
-        // Stale lock (dead process or malformed PID) - remove it
-        fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
-          throw err;
-        }
-        // Other errors reading lock file - try to remove it
-        try { fs.unlinkSync(this.lockPath); } catch { /* ignore */ }
-      }
-    }
-
-    // Write our PID to the lock file using exclusive create flag
+    // A prior operation may have finished but failed to remove its PID file.
+    // Retry that release before trying a new SQLite connection. An actively
+    // held lock without such a failure must remain a non-reentrant error.
+    if (this.releasePending) this.release();
+    if (this.held) throw new FileLockBusyError('CodeGraph database is locked by another process.');
+    // A separate SQLite lease serializes the entire PID inspection/removal and
+    // publication protocol. Unlike a recovery lockfile it is released by the
+    // OS when a process dies; never unlink the lease database while in use.
+    const { DatabaseSync } = require('node:sqlite') as {
+      DatabaseSync: new (file: string) => { exec(sql: string): void; close(): void };
+    };
+    let lease: { exec(sql: string): void; close(): void } | null = null;
     try {
-      fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
-      this.held = true;
-    } catch (err: any) {
-      if (err.code === 'EEXIST') {
-        // Race condition: another process grabbed the lock between our check and write
-        throw new Error(
-          'CodeGraph database is locked by another process. ' +
-          `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-        );
+      const opened = new DatabaseSync(`${this.lockPath}.lease`);
+      lease = opened;
+      // Simultaneous first opens may briefly hold SQLite schema read locks
+      // while both try to upgrade. Give the winner time to finish acquiring;
+      // a genuinely occupied lease still fails promptly and without mutation.
+      opened.exec('PRAGMA busy_timeout = 250; BEGIN EXCLUSIVE');
+    } catch (error) {
+      try { lease?.close(); } catch { /* preserve original failure */ }
+      const code = (error as { errcode?: number } | null)?.errcode;
+      // SQLite reports the extended code; its low byte is BUSY (5) or LOCKED (6).
+      if (typeof code === 'number' && ((code & 0xff) === 5 || (code & 0xff) === 6)) {
+        throw new FileLockBusyError('CodeGraph database is locked by another process.');
       }
-      throw err;
+      throw error;
+    }
+    this.lease = lease;
+
+    const temporary = `${this.lockPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      if (fs.existsSync(this.lockPath)) {
+        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
+        const pid = Number(content);
+        // Node's process.kill accepts signed 32-bit PIDs.
+        if (!/^\d+$/.test(content) || pid <= 0 || pid > 0x7fff_ffff) {
+          throw new Error('CodeGraph database is locked by another process or the lock owner is unknown.');
+        }
+        if (this.isProcessAlive(pid)) {
+          throw new FileLockBusyError(`CodeGraph database is locked by another process (PID ${pid}).`);
+        }
+        fs.unlinkSync(this.lockPath);
+      }
+
+      // Publish a complete PID atomically; a crash while writing the temporary
+      // file cannot leave an empty lock that another process mistakes as stale.
+      fs.writeFileSync(temporary, String(process.pid), { flag: 'wx', mode: 0o600 });
+      fs.linkSync(temporary, this.lockPath);
+      this.held = true;
+    } catch (error) {
+      this.releaseLease();
+      throw error;
+    } finally {
+      try { fs.unlinkSync(temporary); } catch { /* absent or already removed */ }
     }
   }
 
@@ -305,17 +326,31 @@ export class FileLock {
    * Release the lock
    */
   release(): void {
-    if (!this.held) return;
+    if (!this.held) { this.releaseLease(); return; }
     try {
       // Only remove if we still own it (check PID)
       const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-      if (parseInt(content, 10) === process.pid) {
-        fs.unlinkSync(this.lockPath);
+      if (content !== String(process.pid)) throw new Error('CodeGraph lock ownership changed; retaining the write lease.');
+      fs.unlinkSync(this.lockPath);
+    } catch (error) {
+      // A failed read/unlink must retain the lease and ownership so a caller
+      // can retry. Releasing it here could leave a live PID file forever.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.releasePending = true;
+        throw error;
       }
-    } catch {
-      // Lock file already gone - that's fine
     }
+    this.releasePending = false;
     this.held = false;
+    this.releaseLease();
+  }
+
+  private releaseLease(): void {
+    const lease = this.lease;
+    this.lease = null;
+    if (!lease) return;
+    try { lease.exec('ROLLBACK'); } catch { /* close also releases the lease */ }
+    lease.close();
   }
 
   /**
@@ -349,8 +384,11 @@ export class FileLock {
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return false;
+      if (code === 'EPERM') return true;
+      throw error;
     }
   }
 }

@@ -8,10 +8,11 @@
  * - Atomic writes
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync, fork, type ChildProcess } from 'child_process';
 import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
@@ -94,6 +95,130 @@ describe('FileLock', () => {
 
     lock.release();
   });
+
+  it('preserves a lock whose owner cannot be read', () => {
+    fs.writeFileSync(lockPath, '');
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).toThrow(/locked|owner/i);
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe('');
+  });
+
+  it('preserves a lock when owner liveness is denied', () => {
+    const pid = 99999999;
+    fs.writeFileSync(lockPath, String(pid));
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
+    });
+    try {
+      expect(() => new FileLock(lockPath).acquire()).toThrow(/locked/i);
+      expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(pid));
+    } finally { kill.mockRestore(); }
+  });
+
+  it('retains the lease and permits retry if the lock ownership changes', () => {
+    const lock = new FileLock(lockPath);
+    lock.acquire();
+    fs.writeFileSync(lockPath, '99999998');
+    try {
+      expect(() => lock.release()).toThrow(/ownership changed/i);
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(() => new FileLock(lockPath).acquire()).toThrow(/locked/i);
+    } finally {
+      fs.writeFileSync(lockPath, String(process.pid));
+      lock.release();
+    }
+    expect(fs.existsSync(lockPath)).toBe(false);
+    const next = new FileLock(lockPath);
+    next.acquire();
+    next.release();
+  });
+
+  it('retries an earlier failed release before the next acquisition', () => {
+    const lock = new FileLock(lockPath);
+    lock.acquire();
+    fs.writeFileSync(lockPath, '99999998');
+    try {
+      expect(() => lock.release()).toThrow(/ownership changed/i);
+      fs.writeFileSync(lockPath, String(process.pid));
+      expect(() => lock.acquire()).not.toThrow();
+    } finally {
+      fs.writeFileSync(lockPath, String(process.pid));
+      lock.release();
+    }
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('retains the lease when removing the owned PID file is denied', async () => {
+    const ts = await import('typescript');
+    const source = fs.readFileSync(path.resolve(__dirname, '../src/utils.ts'), 'utf8');
+    const modulePath = path.join(tempDir, 'release-utils.cjs');
+    fs.writeFileSync(modulePath, ts.transpileModule(source, {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    }).outputText);
+    const script = path.join(tempDir, 'release-denied.cjs');
+    fs.writeFileSync(script, [
+      "const fs = require('fs');",
+      'const { FileLock } = require(process.argv[2]);',
+      'const name = process.argv[3], lock = new FileLock(name), unlink = fs.unlinkSync;',
+      'lock.acquire();',
+      "fs.unlinkSync = value => { if (String(value) === name) throw Object.assign(new Error('denied'), { code: 'EPERM' }); return unlink(value); };",
+      "let denied = false; try { lock.release(); } catch (error) { denied = error.code === 'EPERM'; }",
+      'fs.unlinkSync = unlink;',
+      "if (!denied) throw new Error('release did not report denied unlink');",
+      "let blocked = false; try { new FileLock(name).acquire(); } catch { blocked = true; }",
+      "if (!blocked) throw new Error('lease was released after denied unlink');",
+      "lock.release(); if (fs.existsSync(name)) throw new Error('retry did not remove PID file');",
+      "process.stdout.write('ok');",
+    ].join('\n'));
+    expect(execFileSync(process.execPath, [script, modulePath, lockPath], { encoding: 'utf8', windowsHide: true })).toBe('ok');
+  }, 30000);
+
+  it('allows only one process to reclaim a stale lock and recovers after its death', async () => {
+    const ts = await import('typescript');
+    const source = fs.readFileSync(path.resolve(__dirname, '../src/utils.ts'), 'utf8');
+    const modulePath = path.join(tempDir, 'utils.cjs');
+    fs.writeFileSync(modulePath, ts.transpileModule(source, {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    }).outputText);
+    const script = path.join(tempDir, 'contender.cjs');
+    fs.writeFileSync(script, [
+      "const { FileLock } = require(process.argv[2]);",
+      'const lock = new FileLock(process.argv[3]);',
+      "process.on('message', () => { try { lock.acquire(); process.send('acquired'); } catch (error) { process.stderr.write(String(error && error.stack || error)); process.send('blocked'); } });",
+      "process.send('ready');",
+    ].join('\n'));
+    fs.writeFileSync(lockPath, '99999999');
+    const children = [0, 1].map(() => fork(script, [modulePath, lockPath], { silent: true, execArgv: [] }));
+    const diagnostics: string[] = [];
+    for (const child of children) child.stderr?.on('data', chunk => diagnostics.push(String(chunk)));
+    const message = (child: ChildProcess): Promise<unknown> => new Promise((resolve, reject) => {
+      child.once('message', resolve);
+      child.once('error', reject);
+    });
+    const exited = (child: ChildProcess): Promise<void> => child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve() : new Promise(resolve => child.once('exit', () => resolve()));
+    try {
+      expect(await Promise.all(children.map(message))).toEqual(['ready', 'ready']);
+      const outcomes = children.map(child => { const result = message(child); child.send('acquire'); return result; });
+      const values = await Promise.all(outcomes);
+      expect(values.filter(value => value === 'acquired'), diagnostics.join('\n')).toHaveLength(1);
+      expect(values.filter(value => value === 'blocked')).toHaveLength(1);
+      const holder = children[values.indexOf('acquired')]!;
+      const stopped = exited(holder);
+      holder.kill('SIGKILL');
+      await stopped;
+      const recovered = new FileLock(lockPath);
+      recovered.acquire();
+      recovered.release();
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      await Promise.all(children.map(async child => {
+        const stopped = exited(child);
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        await stopped;
+      }));
+    }
+  }, 30000);
 
   it('should execute function with withLock', () => {
     const lock = new FileLock(lockPath);

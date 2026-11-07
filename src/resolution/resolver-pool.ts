@@ -35,6 +35,7 @@ export interface ChunkResult {
 interface PoolWorker {
   worker: Worker;
   ready: Promise<void>;
+  rejectReady: (error: Error) => void;
   /** Settles on the worker's first message or its end — see worker-teardown.ts. */
   started: Promise<void>;
   busy: number;
@@ -88,6 +89,8 @@ export class ResolverPool {
   private synthWaiters = new Map<number, { resolve: (r: SynthPassResult) => void; reject: (e: Error) => void }>();
   private recycleWaiters = new Map<number, () => void>();
   private failed: Error | null = null;
+  private closing = false;
+  private destroyPromise: Promise<void> | null = null;
 
   /**
    * Pool size from CPU headroom, memory headroom, and the explicit override.
@@ -163,13 +166,24 @@ export class ResolverPool {
     }
     if (size === null) return null;
     try {
-      return new ResolverPool(workerScript, dbPath, projectRoot, size);
+      const pool = new ResolverPool(workerScript, dbPath, projectRoot, size);
+      return pool.size ? pool : null;
     } catch {
       return null;
     }
   }
 
   private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
+    try {
+      this.startWorkers(workerScript, dbPath, projectRoot, size);
+    } catch (error) {
+      // Keep any workers already created reachable so the owner can await
+      // their shutdown before falling back or closing the database.
+      this.fail(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private startWorkers(workerScript: string, dbPath: string, projectRoot: string, size: number): void {
     for (let i = 0; i < size; i++) {
       const worker = new Worker(workerScript);
       const started = workerStarted(worker);
@@ -179,9 +193,14 @@ export class ResolverPool {
         readyResolve = resolve;
         readyReject = reject;
       });
-      const pw: PoolWorker = { worker, ready, started, busy: 0 };
+      // A worker can fail before anyone awaits readiness; keep the rejection
+      // observed while preserving it for later ready() callers.
+      void ready.catch(() => undefined);
+      let becameReady = false;
+      const pw: PoolWorker = { worker, ready, rejectReady: readyReject, started, busy: 0 };
       worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
+          becameReady = true;
           readyResolve();
         } else if (msg.type === 'result' && msg.id !== undefined) {
           pw.busy--;
@@ -225,18 +244,20 @@ export class ResolverPool {
         readyReject(this.failed!);
       });
       worker.on('exit', (code) => {
-        if (code !== 0) {
+        if (code !== 0 || !becameReady || !this.closing) {
           this.fail(new Error(`resolver worker exited with code ${code}`));
           readyReject(this.failed!);
         }
       });
-      worker.postMessage({ type: 'open', dbPath, projectRoot });
+      // Retain ownership before sending: postMessage can itself throw.
       this.workers.push(pw);
+      worker.postMessage({ type: 'open', dbPath, projectRoot });
     }
   }
 
   private fail(err: Error): void {
     if (!this.failed) this.failed = err;
+    for (const worker of this.workers) worker.rejectReady(this.failed);
     for (const [, waiter] of this.waiters) waiter.reject(this.failed);
     this.waiters.clear();
     for (const [, waiter] of this.synthWaiters) waiter.reject(this.failed);
@@ -258,7 +279,9 @@ export class ResolverPool {
   }
 
   async ready(): Promise<void> {
+    if (this.failed) throw this.failed;
     await Promise.all(this.workers.map((w) => w.ready));
+    if (this.failed) throw this.failed;
   }
 
   /**
@@ -358,8 +381,19 @@ export class ResolverPool {
    * but never while it is still starting up: a pool torn down soon after it
    * booted, on a busy machine, can have a worker still loading its modules.
    */
-  async destroy(closeTimeoutMs = CLOSE_TIMEOUT_MS): Promise<void> {
-    await Promise.all(
+  abort(error: Error): Promise<void> {
+    // A graceful exit has code 0 and otherwise leaves in-flight waiters open.
+    this.fail(error);
+    return this.destroy();
+  }
+
+  destroy(closeTimeoutMs = CLOSE_TIMEOUT_MS): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
+    this.closing = true;
+    // Settle in-flight callers even if a worker exits cleanly during teardown.
+    // Deferring this one microtask lets a concurrent abort preserve its reason.
+    queueMicrotask(() => this.fail(new Error('resolver pool closed')));
+    this.destroyPromise = Promise.all(
       this.workers.map(
         (pw) =>
           new Promise<void>((resolve) => {
@@ -370,9 +404,14 @@ export class ResolverPool {
               clearTimeout(t);
               resolve();
             });
-            pw.worker.postMessage({ type: 'close' });
+            try { pw.worker.postMessage({ type: 'close' }); }
+            catch {
+              clearTimeout(t);
+              void terminateOnceStarted(pw.worker, pw.started).then(() => resolve());
+            }
           })
       )
-    );
+    ).then(() => undefined);
+    return this.destroyPromise;
   }
 }

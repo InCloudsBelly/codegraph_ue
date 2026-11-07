@@ -59,7 +59,9 @@ export function ueTestOnlyLines(source: string): Set<number> {
   const frames: BranchFrame[] = [];
   let activeMask = false;
   for (let i = 0; i < lines.length; i++) {
-    const directive = starts.has(i + 1) ? lines[i]!.match(/^\s*#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b(.*)$/) : null;
+    // The lexical scan preserves CRLF for source coordinates. Strip the CR
+    // only for directive matching: JavaScript's dot does not match it.
+    const directive = starts.has(i + 1) ? lines[i]!.replace(/\r$/, '').match(/^\s*#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b(.*)$/) : null;
     if (!directive) { if (activeMask) masked.add(i + 1); continue; }
     const op = directive[1]!;
     const text = directive[2]!.trim();

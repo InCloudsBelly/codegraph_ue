@@ -9,10 +9,11 @@ import { resurrectRefFromDroppedEdge } from '../src/resolution/resurrect-ref';
 
 // Load the shipped pool and worker together: the source pool deliberately
 // declines to start when resolver-worker.js is absent beside its .ts file.
-const CodeGraph = (require('../dist') as typeof import('../src')).default;
-const { ResolverPool } = require('../dist/resolution/resolver-pool') as typeof import('../src/resolution/resolver-pool');
-const { ReferenceResolver } = require('../dist/resolution') as typeof import('../src/resolution');
-const { SYNTH_PASSES } = require('../dist/resolution/callback-synthesizer') as typeof import('../src/resolution/callback-synthesizer');
+const testDist = process.env.CODEGRAPH_TEST_DIST ?? path.resolve('dist');
+const CodeGraph = (require(testDist) as typeof import('../src')).default;
+const { ResolverPool } = require(path.join(testDist, 'resolution/resolver-pool')) as typeof import('../src/resolution/resolver-pool');
+const { ReferenceResolver } = require(path.join(testDist, 'resolution')) as typeof import('../src/resolution');
+const { SYNTH_PASSES } = require(path.join(testDist, 'resolution/callback-synthesizer')) as typeof import('../src/resolution/callback-synthesizer');
 const roots: string[] = [];
 const graphs: Array<InstanceType<typeof CodeGraph>> = [];
 const rules = (name: string, body = '', base = 'ModuleRules') =>

@@ -266,9 +266,8 @@ export interface FileRecord {
 }
 
 /**
- * Indexed files whose symbols are missing even though their content hash is
- * current — what a hash comparison alone calls "up to date" (#2336). Paths are
- * project-relative and sorted.
+ * Indexed files with missing or potentially incomplete symbols even when
+ * their content hash is current. Paths are project-relative and sorted.
  */
 export interface IndexHealth {
   /**
@@ -277,8 +276,8 @@ export interface IndexHealth {
    */
   needsReindex: string[];
   /**
-   * Files with a recorded parse error and no symbols from it. Deterministic:
-   * they stay this way until the file (or the parser) changes.
+   * Files with a recorded parse error or partial parse. A partial parse may
+   * still contain usable symbols and can change when the source or parser does.
    */
   parseErrors: string[];
 }

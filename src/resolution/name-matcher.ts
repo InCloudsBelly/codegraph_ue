@@ -16,6 +16,7 @@ import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary 
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
+import { UE_CPP_UNCERTAIN_LINKAGE } from '../extraction/ue-cpp-declarations';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNameMacros, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
@@ -25771,13 +25772,13 @@ const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, strin
  * not at all. A method a macro defines writes its list in its expansion.
  */
 function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
-  const macro = cppMacroMethodHead(n);
-  const own = macro !== null ? cppParenListIn(macro, 0, name) : cppParenListAfter(n.filePath, n.startLine, 0, name, context);
-  if (own === null || n.kind !== 'method') return own;
   let memo = CPP_OVERLOAD_PARAMETERS.get(context);
   if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
   const hit = memo.get(n.id);
   if (hit !== undefined) return hit;
+  const macro = cppMacroMethodHead(n);
+  const own = macro !== null ? cppParenListIn(macro, 0, name) : cppParenListAfter(n.filePath, n.startLine, n.startColumn ?? 0, name, context);
+  if (own === null || n.kind !== 'method') { memo.set(n.id, own); return own; }
   let found = own;
   const classes = cppClassDecls(cppParentScope(n.qualifiedName), context);
   if (!classes.some((c) => c.filePath === n.filePath && rangeWithin(n, c))) {
@@ -25802,6 +25803,39 @@ function cppOverloadParameters(n: Node, name: string, context: ResolutionContext
   }
   memo.set(n.id, found);
   return found;
+}
+
+/** Comparable parameter identity for a free-function declaration/definition. */
+export function cppFreeFunctionKey(node: Node, context: ResolutionContext): string | null {
+  if ((node.language !== 'cpp' && node.language !== 'c') || node.kind !== 'function' || node.isStatic ||
+      node.decorators?.includes(UE_CPP_UNCERTAIN_LINKAGE)) return null;
+  // A function template and a non-template can share written parameter types
+  // without being the same entity. Keep such cases as separate candidates.
+  if (node.language === 'cpp' && cppOwnTemplateParameters(node, context).length > 0) return null;
+  const source = context.readFile(node.filePath);
+  if (source === null || /^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b/m.test(source)) return null;
+  const list = cppOverloadParameters(node, node.name, context);
+  if (list === null || list.includes('...')) return null;
+  // In C an empty parameter list is not a prototype. Only the explicit
+  // `(void)` form is paired without additional type/linkage context.
+  if (node.language === 'c' && cppWithoutComments(list).trim() !== 'void') return null;
+  const builtin = (type: string): boolean => {
+    const words = type.replace(/[*&]/g, ' ').trim().split(/\s+/);
+    return words.length > 0 && words.every(word =>
+      /^(?:const|volatile|signed|unsigned|short|long|int|char|wchar_t|char8_t|char16_t|char32_t|bool|float|double)$/.test(word)) &&
+      words.some(word => !/^(?:const|volatile)$/.test(word));
+  };
+  const types = splitCppTopLevel(cppWithoutComments(list))
+    .filter(parameter => parameter !== 'void')
+    .map(parameter => {
+      const text = parameter.split('=')[0]!.trim();
+      if (builtin(text)) return text.replace(/\s+/g, ' ').replace(/\s*([*&])\s*/g, '$1');
+      const named = /^(.*[\s*&])([A-Za-z_]\w*)$/.exec(text);
+      const type = named?.[1]?.trim();
+      return type && builtin(type) ? type.replace(/\s+/g, ' ').replace(/\s*([*&])\s*/g, '$1') : null;
+    });
+  if (types.some(type => !type)) return null;
+  return JSON.stringify([node.qualifiedName, types]);
 }
 
 /** A C++ parameter that is a pack: `T&&... args`, not the `...` inside `format_string<T...>`. */

@@ -4,10 +4,13 @@ import { ansiColorsEnabled } from './color';
 import { getGlyphs } from './glyphs';
 
 const PHASE_NAMES: Record<string, string> = {
+  observing: 'Observing UE scope',
   scanning: 'Scanning files',
   parsing: 'Parsing code',
   storing: 'Storing data',
   resolving: 'Resolving refs',
+  refreshing: 'Refreshing UE candidates',
+  verifying: 'Verifying UE generation',
   linking: 'Linking dynamic dispatch',
 };
 

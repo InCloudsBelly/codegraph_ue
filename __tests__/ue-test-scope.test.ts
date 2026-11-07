@@ -49,4 +49,18 @@ describe('UE confirmed test branches', () => {
     expect(isUeTestOnlyFile(source)).toBe(false);
     expect([...ueTestOnlyLines('#if defined(WITH_DEV_AUTOMATION_TESTS)\nvoid AlsoProduction();\n#endif\n')]).toEqual([]);
   });
+
+  it('excludes confirmed test branches with CRLF while retaining production lines', () => {
+    const mixed = [
+      'void ProductionBefore();',
+      '#if WITH_DEV_AUTOMATION_TESTS',
+      'void AutomationOnly();',
+      '#else',
+      'void ProductionElse();',
+      '#endif',
+    ].join('\r\n');
+    expect([...ueTestOnlyLines(mixed)]).toEqual([3]);
+    expect(isUeTestOnlyFile(mixed)).toBe(false);
+    expect(isUeTestOnlyFile('#if WITH_DEV_AUTOMATION_TESTS\r\nvoid TestOnly() {}\r\n#endif\r\n')).toBe(true);
+  });
 });
